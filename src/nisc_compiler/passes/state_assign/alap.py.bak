@@ -1,0 +1,293 @@
+"""
+alap.py: ALAPスケジューリングパス（演算器制約対応版）
+"""
+from __future__ import annotations
+from collections import defaultdict
+import networkx as nx
+
+from nisc_compiler.passes.base import StateAssignBase
+from nisc_compiler.context import CompileContext
+from nisc_compiler.passes.operator_assign.dp import load_dp, Operator
+from nisc_compiler.passes.register_allocate.allocator import allocate
+
+
+class ScheduleError(Exception):
+    pass
+
+
+def _get_all_bbs(cdfg):
+    return [n for n, d in cdfg.nodes(data=True) if d.get('type') == 'bb']
+
+
+def _get_bb_subgraph(cdfg, bb_id):
+    return [dst for _, dst, edata in cdfg.out_edges(bb_id, data=True)
+            if edata.get('label') == 'contains'
+            and cdfg.nodes[dst].get('type') == 'op']
+
+
+def _get_ctrl_children(cdfg, bb_id):
+    children = defaultdict(list)
+    for _, dst, edata in cdfg.out_edges(bb_id, data=True):
+        if cdfg.nodes[dst].get('type') == 'bb':
+            children[edata.get('label', '')].append(dst)
+    return dict(children)
+
+
+def _data_predecessors(cdfg, node_id):
+    return [src for src, _, edata in cdfg.in_edges(node_id, data=True)
+            if edata.get('type') == 'data']
+
+
+def _data_successors(cdfg, node_id):
+    return [dst for _, dst, edata in cdfg.out_edges(node_id, data=True)
+            if edata.get('type') == 'data']
+
+
+def schedule_bb_alap(cdfg, bb_id, operators, state_offset=0):
+    op_nodes = _get_bb_subgraph(cdfg, bb_id)
+    if not op_nodes:
+        return state_offset - 1
+
+    op_map = {op.name: op for op in operators}
+    state_usage = defaultdict(lambda: defaultdict(int))
+
+    subgraph = cdfg.subgraph(op_nodes)
+    try:
+        topo_order = list(nx.topological_sort(subgraph))
+    except nx.NetworkXUnfeasible:
+        raise ScheduleError(f"Cycle detected in BB {bb_id}")
+
+    group_to_nodes = defaultdict(list)
+    for node_id in topo_order:
+        data = cdfg.nodes[node_id]
+        if data.get('assigned_op') is None:
+            continue
+        group = data.get('match_group')
+        if group is not None:
+            group_to_nodes[group].append(node_id)
+
+    # ステップ1: ASAP最早stateを計算（下限）
+    asap_state = {}
+    scheduled_groups_asap = set()
+
+    for node_id in topo_order:
+        data = cdfg.nodes[node_id]
+        assigned_op = data.get('assigned_op')
+        if assigned_op is None:
+            continue
+        group = data.get('match_group')
+        if group is not None and group in scheduled_groups_asap:
+            asap_state[node_id] = asap_state[group_to_nodes[group][0]]
+            continue
+        group_nodes = group_to_nodes[group] if group is not None else [node_id]
+        earliest = state_offset
+        for gnode_id in group_nodes:
+            for pred_id in _data_predecessors(cdfg, gnode_id):
+                pred_group = cdfg.nodes[pred_id].get('match_group')
+                if pred_group is not None and pred_group == group:
+                    continue
+                if pred_id in asap_state:
+                    pred_latency = cdfg.nodes[pred_id].get('latency', 1)
+                    earliest = max(earliest, asap_state[pred_id] + pred_latency)
+        for gnode_id in group_nodes:
+            asap_state[gnode_id] = earliest
+        if group is not None:
+            scheduled_groups_asap.add(group)
+
+    if not asap_state:
+        return state_offset - 1
+
+    # ALAP上限（演算器制約なしで計算）
+    alap_upper = max(
+        asap_state[n] + cdfg.nodes[n].get('latency', 1) - 1
+        for n in asap_state
+    )
+
+    # ステップ2: ALAP最遅stateを計算（演算器制約なし）
+    alap_state = {}
+    scheduled_groups_alap = set()
+
+    for node_id in reversed(topo_order):
+        data = cdfg.nodes[node_id]
+        assigned_op = data.get('assigned_op')
+        if assigned_op is None:
+            continue
+        group = data.get('match_group')
+        if group is not None and group in scheduled_groups_alap:
+            alap_state[node_id] = alap_state[group_to_nodes[group][0]]
+            continue
+        group_nodes = group_to_nodes[group] if group is not None else [node_id]
+        latency = cdfg.nodes[node_id].get('latency', 1)
+        latest = alap_upper - latency + 1
+        for gnode_id in group_nodes:
+            for succ_id in _data_successors(cdfg, gnode_id):
+                succ_group = cdfg.nodes[succ_id].get('match_group')
+                if succ_group is not None and succ_group == group:
+                    continue
+                if succ_id in alap_state:
+                    latest = min(latest, alap_state[succ_id] - latency)
+        latest = max(latest, asap_state.get(node_id, state_offset))
+        for gnode_id in group_nodes:
+            alap_state[gnode_id] = latest
+        if group is not None:
+            scheduled_groups_alap.add(group)
+
+    # ステップ3: 演算器制約を考慮しながら配置
+    # topo_order順（前から）でalap_stateから配置
+    scheduled_groups_final = set()
+
+    for node_id in topo_order:  # ← revervedを外す
+        data = cdfg.nodes[node_id]
+        assigned_op = data.get('assigned_op')
+        if assigned_op is None:
+            continue
+        operator = op_map.get(assigned_op)
+        if operator is None:
+            raise ScheduleError(f"Operator '{assigned_op}' not found in dp")
+        group = data.get('match_group')
+        if group is not None and group in scheduled_groups_final:
+            continue
+        group_nodes = group_to_nodes[group] if group is not None else [node_id]
+        latency = data.get('latency', 1)
+
+        # 配置済みの前のノードのstateから最早stateを動的に計算
+        earliest = state_offset
+        for gnode_id in group_nodes:
+            for pred_id in _data_predecessors(cdfg, gnode_id):
+                pred_group = cdfg.nodes[pred_id].get('match_group')
+                if pred_group is not None and pred_group == group:
+                    continue
+                pred_state = cdfg.nodes[pred_id].get('state')
+                if pred_state is not None:
+                    pred_latency = cdfg.nodes[pred_id].get('latency', 1)
+                    earliest = max(earliest, pred_state + pred_latency)
+
+        # alap_stateと比較して大きい方から開始
+        state = max(alap_state.get(node_id, earliest), earliest)
+
+        while True:
+            if state_usage[state][assigned_op] < operator.count:
+                break
+            state += 1
+
+        for gnode_id in group_nodes:
+            cdfg.nodes[gnode_id]['state'] = state
+
+        occupy_cycles = 1 if operator.pipelined else operator.latency
+        for s in range(state, state + occupy_cycles):
+            state_usage[s][assigned_op] += 1
+
+        if group is not None:
+            scheduled_groups_final.add(group)
+
+    states = [
+        cdfg.nodes[n].get('state')
+        for n in op_nodes
+        if cdfg.nodes[n].get('state') is not None
+    ]
+    return max(states) if states else state_offset - 1
+
+
+def schedule_alap(cdfg, operators=None):
+    if operators is None:
+        operators = load_dp()
+
+    all_bbs = _get_all_bbs(cdfg)
+    bb_set = set(all_bbs)
+    bb_subgraph = cdfg.subgraph(all_bbs)
+
+    try:
+        topo_bbs = [n for n in nx.topological_sort(bb_subgraph) if n in bb_set]
+    except nx.NetworkXUnfeasible:
+        topo_bbs = all_bbs
+
+    bb_offset = {}
+    bb_last = {}
+    current_offset = 0
+
+    for bb_id in topo_bbs:
+        if bb_id not in bb_offset:
+            bb_offset[bb_id] = current_offset
+        offset = bb_offset[bb_id]
+
+        last_state = schedule_bb_alap(cdfg, bb_id, operators, state_offset=offset)
+        bb_last[bb_id] = last_state
+
+        children = _get_ctrl_children(cdfg, bb_id)
+        then_bbs = children.get('then', [])
+        else_bbs = children.get('else', [])
+
+        if then_bbs or else_bbs:
+            branch_offset = last_state + 1
+            for child in then_bbs + else_bbs:
+                if child not in bb_offset:
+                    bb_offset[child] = branch_offset
+            continue
+
+        body_bbs = children.get('body', [])
+        cond_bbs = children.get('cond', [])
+        for child in body_bbs + cond_bbs:
+            if child not in bb_offset:
+                bb_offset[child] = last_state + 1
+
+        contains_bbs = children.get('contains', [])
+        for child in contains_bbs:
+            if child not in bb_offset:
+                bb_offset[child] = last_state + 1
+
+        if not (then_bbs or else_bbs or body_bbs or cond_bbs or contains_bbs):
+            current_offset = last_state + 1
+
+    from nisc_compiler.passes.state_assign.core import _add_done_state
+    cdfg = _add_done_state(cdfg)
+
+    return cdfg
+
+
+def iterative_schedule_alap(cdfg, operators, num_registers=32, num_imm_registers=32, max_iter=10):
+    from nisc_compiler.passes.state_assign.core import reset_states, insert_spill_nodes
+
+    global_spill_map = {}
+
+    for i in range(max_iter):
+        print(f"[iter {i+1}] scheduling (ALAP)...")
+        cdfg = schedule_alap(cdfg, operators)
+
+        print(f"[iter {i+1}] allocating registers...")
+        cdfg, reg_map, imm_map, spill_map, spill_base_reg = allocate(
+            cdfg,
+            num_registers=num_registers,
+            num_imm_registers=num_imm_registers,
+        )
+
+        if not spill_map:
+            print(f"[iter {i+1}] done. no spills.")
+            final_spill_base_reg = num_registers - 1 if global_spill_map else -1
+            return cdfg, reg_map, imm_map, global_spill_map, final_spill_base_reg, i + 1
+
+        print(f"[iter {i+1}] {len(spill_map)} spill(s) → inserting spill nodes...")
+        global_spill_map.update(spill_map)
+
+        cdfg = insert_spill_nodes(cdfg, spill_map, spill_base_reg)
+        cdfg = reset_states(cdfg)
+
+    raise RuntimeError(f"Spill did not converge after {max_iter} iterations.")
+
+
+class ALAPStateAssignPass(StateAssignBase):
+    """ALAPスケジューリングによるステート割り当てパス。"""
+    name = "state_assign"
+
+    def run(self, cdfg: nx.DiGraph, context: CompileContext) -> nx.DiGraph:
+        cdfg, reg_map, imm_map, spill_map, spill_base_reg, iters = iterative_schedule_alap(
+            cdfg,
+            context.operators,
+            num_registers=context.num_registers,
+            num_imm_registers=context.num_imm_registers,
+        )
+        context.reg_map = reg_map
+        context.imm_map = imm_map
+        context.spill_map = spill_map
+        context.spill_base_reg = spill_base_reg
+        context.iterations = iters
+        return cdfg

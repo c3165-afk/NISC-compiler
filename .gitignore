@@ -1,0 +1,26 @@
+# Python venv
+.compiler/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Compilation output
+output/
+
+# IDE / editor
+.metals/
+.scala-build/
+.vscode/
+.bloop/
+
+# OS / Windows share metadata
+*:Zone.Identifier
+
+# JVM/Scala crash logs from the Windows/Vivado environment
+hs_err_pid*.log
+hs_err_pid*.dmp
+debug*.jou
+debug*.log
+
+# Local experiment files (not the pipeline)
+# 追加する必要が出たらここに追記
