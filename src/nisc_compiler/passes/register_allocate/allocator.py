@@ -21,69 +21,6 @@ class AllocationError(Exception):
     pass
 
 
-def cfg_interference(graph, imm_map):
-    """Fixed-point liveness over CFG edges, including back edges and held inputs.
-
-    Phi storage is defined by real predecessor copies, not by the zero-cycle
-    phi marker. Work at commit cycles and reserve destinations from launch.
-    """
-    aliases = graph.graph.get('aliases', {})
-    canonical = lambda s: aliases.get(s, s)
-    blocks = graph.graph['blocks']
-    interference = nx.Graph()
-    values = {s for _, d in graph.nodes(data=True)
-              if d['op_name'] != 'arith.cmpi'
-              for s in d.get('results', []) if s not in imm_map}
-    interference.add_nodes_from(sorted({canonical(s) for s in values}))
-    events = {}
-    for bb, meta in blocks.items():
-        rows = {t: [set(), set(), set()] for t in range(meta['start'], meta['end'] + 1)}
-        for _, n, e in graph.out_edges(bb, data=True):
-            d = graph.nodes[n]
-            if e.get('label') != 'contains' or d['type'] != 'op':
-                continue
-            uses = {canonical(s) for s in d['operands'] if s not in imm_map}
-            defs = {canonical(s) for s in d['results']} if d['op_name'] != 'arith.cmpi' else set()
-            end = d['state'] + d['latency'] - 1
-            for t in range(d['state'], end + 1):
-                rows[t][0].update(uses)
-                rows[t][2].update(defs)
-            rows[end][1].update(defs)
-        events[bb] = list(rows.values())
-    live_in = {bb: set() for bb in blocks}
-    live_out = {bb: set() for bb in blocks}
-    changed = True
-    while changed:
-        changed = False
-        for bb in reversed(list(blocks)):
-            after = set().union(*(live_in[s] for s in blocks[bb]['successors']))
-            before = set(after)
-            for uses, defs, _ in reversed(events[bb]):
-                before = (before - defs) | uses
-            if before != live_in[bb] or after != live_out[bb]:
-                live_in[bb], live_out[bb] = before, after
-                changed = True
-    for bb in blocks:
-        live = set(live_out[bb])
-        for uses, defs, reserved in reversed(events[bb]):
-            before = (live - defs) | uses
-            occupied = sorted(live | before | reserved)
-            interference.add_edges_from((a, b) for i, a in enumerate(occupied) for b in occupied[i + 1:])
-            live = before
-    if live_in[graph.graph['entry']]:
-        raise AllocationError('CFG reads values before initialization')
-    return interference, values
-
-
-def allocate_cfg(graph, context):
-    interference, values = cfg_interference(graph, context.imm_map)
-    colors = nx.coloring.greedy_color(interference, strategy='largest_first')
-    if colors and max(colors.values()) + 1 >= context.num_registers:
-        raise AllocationError('int32 register capacity exceeded; CFG spilling is unsupported')
-    aliases = graph.graph.get('aliases', {})
-    return {s: colors[aliases.get(s, s)] + 1 for s in values}
-
-
 @dataclass
 class LiveRange:
     """SSA変数の生存区間。"""

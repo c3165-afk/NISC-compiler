@@ -14,8 +14,4 @@ class MLIRToCDFGPass(MLIRToCDFGBase):
     name = "mlir_to_cdfg"
 
     def run(self, cdfg: None, context: CompileContext) -> nx.DiGraph:
-        graph = lower_mlir(context.mlir_text, stable_names=context.profile == 'int32')
-        if context.profile == "int32":
-            from .int32 import add_abi
-            graph = add_abi(graph, context.extra['abi'])
-        return graph
+        return lower_mlir(context.mlir_text)

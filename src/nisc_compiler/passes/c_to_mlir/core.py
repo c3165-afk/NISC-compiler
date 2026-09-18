@@ -72,18 +72,13 @@ class MLIRGen:
                 return f
         raise ParseError(f"Function '{name}' not found.")
 
-    def _gen_func(self, func: c_ast.FuncDef, normalize_returns: bool = False) -> str:
+    def _gen_func(self, func: c_ast.FuncDef) -> str:
         name = func.decl.name
 
         # 引数
         params = []
         if func.decl.type.args:
             for param in func.decl.type.args.params:
-                # f(void) has no parameter; void is not a named SSA value.
-                if isinstance(param, c_ast.Typename):
-                    t = param.type
-                    if isinstance(t, c_ast.TypeDecl) and getattr(t.type, 'names', []) == ['void']:
-                        continue
                 ptype = self._extract_type(param)
                 ssa = f"%{param.name}"
                 self._env[param.name] = ssa
@@ -91,11 +86,7 @@ class MLIRGen:
                 params.append(f"{ssa}: {ptype}")
 
         ret_type = self._extract_ret_type(func)
-        if normalize_returns:
-            value = self._gen_returning_sequence(func.body.block_items or [])
-            self._emit(f'return {value} : {self._type(value)}')
-        else:
-            self._gen_compound(func.body)
+        self._gen_compound(func.body)
 
         if ret_type == "void":
             sig = f"func.func @{name}({', '.join(params)})"
@@ -110,56 +101,6 @@ class MLIRGen:
     # ----------------------------------------------------------------
     # 文
     # ----------------------------------------------------------------
-    @staticmethod
-    def _contains_return(stmt):
-        if isinstance(stmt, c_ast.Return):
-            return True
-        if isinstance(stmt, c_ast.Compound):
-            return any(MLIRGen._contains_return(s) for s in stmt.block_items or [])
-        if isinstance(stmt, c_ast.If):
-            return (MLIRGen._contains_return(stmt.iftrue)
-                    or MLIRGen._contains_return(stmt.iffalse))
-        return False
-
-    def _gen_returning_sequence(self, statements):
-        """Lower validated, binding-renamed int32 statements to one return value.
-
-        A return ends this continuation. For an if containing returns, put the
-        continuation into each arm that reaches it, yielding only its final
-        return value. This keeps func.return out of scf regions and reuses the
-        existing edge-copy join and single SRAM return store. Declaration names
-        must already be unique: flattening a compound must not change binding.
-        """
-        for index, stmt in enumerate(statements):
-            tail = statements[index + 1:]
-            if isinstance(stmt, c_ast.Return):
-                return self._gen_expr(stmt.expr)
-            if isinstance(stmt, c_ast.Compound) and self._contains_return(stmt):
-                return self._gen_returning_sequence(list(stmt.block_items or []) + tail)
-            if isinstance(stmt, c_ast.If) and self._contains_return(stmt):
-                condition = self._condition(stmt.cond)
-                saved_env, saved_body = dict(self._env), self._body
-                arms = []
-                for arm in (stmt.iftrue, stmt.iffalse):
-                    self._env, self._body = dict(saved_env), []
-                    body = list(arm.block_items or []) if isinstance(arm, c_ast.Compound) else (
-                        [arm] if arm is not None else [])
-                    value = self._gen_returning_sequence(body + tail)
-                    arms.append((self._body, value))
-                self._env, self._body = saved_env, saved_body
-                result = self._new_ssa('i32')
-                self._emit(f'{result} = scf.if {condition} -> (i32) {{')
-                for arm_index, (body, value) in enumerate(arms):
-                    if arm_index:
-                        self._emit('} else {')
-                    for inst in body:
-                        self._emit('    ' + inst)
-                    self._emit(f'    scf.yield {value} : i32')
-                self._emit('}')
-                return result
-            self._gen_stmt(stmt)
-        raise ParseError('Every reachable path must return an int value')
-
     def _gen_compound(self, compound: c_ast.Compound):
         if compound.block_items:
             for stmt in compound.block_items:
@@ -176,12 +117,6 @@ class MLIRGen:
             self._gen_decl(stmt)
         elif isinstance(stmt, c_ast.Assignment):
             self._gen_assignment(stmt)
-        elif isinstance(stmt, c_ast.UnaryOp) and stmt.op in ('++', '--', 'p++', 'p--'):
-            self._gen_assignment(c_ast.Assignment('+=' if '+' in stmt.op else '-=',
-                                                 stmt.expr, c_ast.Constant('int', '1')))
-        elif isinstance(stmt, (c_ast.DeclList, c_ast.ExprList)):
-            for child in stmt.decls if isinstance(stmt, c_ast.DeclList) else stmt.exprs:
-                self._gen_stmt(child)
         elif isinstance(stmt, c_ast.For):
             self._gen_for(stmt)
         elif isinstance(stmt, c_ast.While):
@@ -626,11 +561,7 @@ class MLIRGen:
         return result
 
     def _gen_constant(self, expr: c_ast.Constant) -> str:
-        if expr.type == "int":
-            text = expr.value
-            radix = 16 if text.lower().startswith('0x') else (8 if text.startswith('0') else 10)
-            typ, val = "i32", str(int(text, radix))
-        elif expr.type == "long":
+        if expr.type in ("int", "long"):
             typ, val = "i32", expr.value
         else:
             typ = "f32"
@@ -747,147 +678,6 @@ class MLIRGen:
         source = re.sub(r'/\*.*?\*/', '', source, flags=re.DOTALL)
         source = re.sub(r'//[^\n]*', '', source)
         return source
-
-
-class CFGMLIRGen(MLIRGen):
-    """Explicit CFG for validated int32 ASTs with unique declaration identities.
-
-    Block arguments carry the variable environment. Returns always branch to a
-    single exit; terminated arms never acquire a fallthrough or loop back edge.
-    """
-
-    @staticmethod
-    def contains_loop(node):
-        return isinstance(node, (c_ast.For, c_ast.While)) or any(
-            CFGMLIRGen.contains_loop(child) for _, child in node.children())
-
-    def _block(self, names):
-        block = {'label': f'b{len(self._blocks)}',
-                 'env': {name: self._new_ssa('i32') for name in names}, 'body': []}
-        self._blocks.append(block)
-        return block
-
-    def _enter(self, block):
-        self._env, self._body = dict(block['env']), block['body']
-
-    def _target(self, block, env):
-        values = [env[name] for name in block['env']]
-        return '^' + block['label'] + (
-            '(' + ', '.join(values) + ' : ' + ', '.join('i32' for _ in values) + ')' if values else '')
-
-    def _jump(self, block, env=None):
-        self._emit('cf.br ' + self._target(block, self._env if env is None else env))
-        self._body = None
-
-    def _branch(self, condition, yes, no):
-        self._emit(f'cf.cond_br {condition}, {self._target(yes, self._env)}, {self._target(no, self._env)}')
-        self._body = None
-
-    def generate_resolved(self, func):
-        self._blocks = []
-        params = []
-        for param in func.decl.type.args.params if func.decl.type.args else []:
-            if isinstance(param, c_ast.Typename):
-                continue
-            value = self._new_ssa('i32')
-            self._env[param.name] = value
-            params.append(f'{value}: i32')
-        entry_body = self._body
-        self._exit = self._block(['$return'])
-        self._gen_stmt(func.body)
-        if self._body is not None:
-            raise ParseError('Every reachable path must return an int value')
-        self._enter(self._exit)
-        self._emit(f'return {self._env["$return"]} : i32')
-        lines = [f'func.func @{func.decl.name}({", ".join(params)}) -> i32 {{']
-        lines.extend('    ' + s for s in entry_body)
-        for block in [b for b in self._blocks if b is not self._exit] + [self._exit]:
-            args = ', '.join(f'{s}: i32' for s in block['env'].values())
-            lines.append(f'  ^{block["label"]}' + (f'({args})' if args else '') + ':')
-            lines.extend('    ' + s for s in block['body'])
-        return '\n'.join(lines + ['}'])
-
-    def _condition(self, expr):
-        if isinstance(expr, c_ast.BinaryOp) and expr.op in self.CMPI_PRED:
-            return self._gen_cmp(expr)
-        value = self._gen_expr(expr) if expr is not None else self._gen_constant(c_ast.Constant('int', '1'))
-        zero = self._gen_constant(c_ast.Constant('int', '0'))
-        flag = self._new_ssa('i1')
-        self._emit(f'{flag} = arith.cmpi ne, {value}, {zero} : i32')
-        return flag
-
-    def _gen_expr(self, expr):
-        if isinstance(expr, c_ast.BinaryOp) and expr.op in self.CMPI_PRED:
-            flag = self._gen_cmp(expr)
-            saved = dict(self._env)
-            yes, no, join = self._block([]), self._block([]), self._block(['$value'])
-            self._branch(flag, yes, no)
-            for block, literal in ((yes, '1'), (no, '0')):
-                self._enter(block)
-                value = self._gen_constant(c_ast.Constant('int', literal))
-                self._jump(join, {'$value': value})
-            self._enter(join)
-            value = self._env['$value']
-            self._env = saved
-            return value
-        return super()._gen_expr(expr)
-
-    def _gen_stmt(self, stmt):
-        if stmt is None or self._body is None:
-            return
-        if isinstance(stmt, c_ast.Compound):
-            outer = set(self._env)
-            for child in stmt.block_items or []:
-                self._gen_stmt(child)
-            self._env = {k: v for k, v in self._env.items() if k in outer}
-        elif isinstance(stmt, c_ast.Return):
-            value = self._gen_expr(stmt.expr)
-            self._jump(self._exit, {'$return': value})
-        elif isinstance(stmt, c_ast.If):
-            condition = self._condition(stmt.cond)
-            names = list(self._env)
-            yes, no = self._block(names), self._block(names)
-            self._branch(condition, yes, no)
-            ends = []
-            for block, arm in ((yes, stmt.iftrue), (no, stmt.iffalse)):
-                self._enter(block)
-                self._gen_stmt(arm)
-                if self._body is not None:
-                    ends.append((self._body, dict(self._env)))
-            if ends:
-                join = self._block(names)
-                for body, env in ends:
-                    self._body, self._env = body, env
-                    self._jump(join)
-                self._enter(join)
-            else:
-                self._body = None
-        elif isinstance(stmt, (c_ast.While, c_ast.For)):
-            outer = set(self._env)
-            if isinstance(stmt, c_ast.For):
-                self._gen_stmt(stmt.init)
-            names = list(self._env)
-            header, body, after = self._block(names), self._block(names), self._block(names)
-            self._jump(header)
-            self._enter(header)
-            condition = self._condition(stmt.cond)
-            self._branch(condition, body, after)
-            self._enter(body)
-            self._gen_stmt(stmt.stmt)
-            if self._body is not None:
-                if isinstance(stmt, c_ast.For):
-                    self._gen_stmt(stmt.next)
-                self._jump(header)
-            self._enter(after)
-            self._env = {k: v for k, v in self._env.items() if k in outer}
-        elif isinstance(stmt, (c_ast.DeclList, c_ast.ExprList)):
-            for child in stmt.decls if isinstance(stmt, c_ast.DeclList) else stmt.exprs:
-                self._gen_stmt(child)
-        elif isinstance(stmt, c_ast.UnaryOp) and stmt.op in ('++', '--', 'p++', 'p--'):
-            self._gen_assignment(c_ast.Assignment('+=' if '+' in stmt.op else '-=',
-                                                 stmt.expr, c_ast.Constant('int', '1')))
-        elif not isinstance(stmt, c_ast.EmptyStatement):
-            super()._gen_stmt(stmt)
 
 
 # ----------------------------------------------------------------

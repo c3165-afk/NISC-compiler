@@ -23,8 +23,6 @@ class CompileContext:
     num_registers: int = 32
     num_imm_registers: int = 32
     reg_width: int = 32      # ← 追加（GPRのビット幅）
-    profile: str = "int32"
-    memory_words: int = 256
 
     # MLIR中間表現
     mlir_text: str = ""

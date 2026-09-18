@@ -33,29 +33,21 @@ ALU_CODE = {
     "nisc.iv_init": "ALU_COPY",  # ← 追加
 }
 
-# 比較器制御の共通定義。<= と > は入力を交換して実装する。
-COMPARISONS = {'eq': ('eq', False), 'ne': ('ne', False),
-               'slt': ('lt', False), 'sle': ('ge', True),
-               'sgt': ('lt', True), 'sge': ('ge', False)}
-CMP_CODES = {'eq': 'BR_BEQ', 'ne': 'BR_BNE', 'lt': 'BR_BLT', 'ge': 'BR_BGE'}
-
-
-def lower_integer_comparison(node: dict) -> tuple[str, list]:
-    """共通の比較器操作と入力順を返す。元のCDFGノードは変更しない。
-
-    不明な条件を別条件で代用しない。浮動小数点・符号なし比較には
-    専用のハードウェア仕様が必要なので、ここでは拒否する。
-    """
-    if node.get('op_name') != 'arith.cmpi' or node.get('operand_typ') != 'i32':
-        raise ValueError('Comparator backend supports only i32 integer comparisons')
-    predicate = node.get('predicate')
-    if predicate not in COMPARISONS:
-        raise ValueError(f'Missing or unsupported comparison predicate: {predicate!r}')
-    operands = list(node.get('operands', []))
-    if len(operands) != 2:
-        raise ValueError('Comparison requires exactly two operands')
-    operation, swap = COMPARISONS[predicate]
-    return operation, operands[::-1] if swap else operands
+# CMP演算コード（MLIRのpredicate → Defs定数）
+CMP_CODE = {
+    "slt": "BR_BLT",
+    "sle": "BR_BGE",
+    "sgt": "BR_BLT",  # 反転
+    "sge": "BR_BGE",  # 反転
+    "eq":  "BR_BEQ",
+    "ne":  "BR_BNE",
+    "olt": "BR_BLT",
+    "ole": "BR_BGE",
+    "ogt": "BR_BLT",
+    "oge": "BR_BGE",
+    "oeq": "BR_BEQ",
+    "one": "BR_BNE",
+}
 
 # 演算器名 → writeback信号名（wen, waddr）
 WB_SIGNALS = {
@@ -645,8 +637,9 @@ def gen_dec(cdfg: nx.DiGraph, reg_map: dict[str, int],
 
             # CMP演算
             elif op_name in ('arith.cmpi', 'arith.cmpf'):
-                comparison, operands = lower_integer_comparison(data)
-                lines.append(f"            io.dp.cmp_code           := {CMP_CODES[comparison]}")
+                # predicateはop_nameから取れないのでデフォルトでBR_BLTを使用
+                # TODO: predicateをCDFGに保存する
+                lines.append(f"            io.dp.cmp_code           := BR_BLT")
 
                 if len(operands) > 0:
                     op0 = operands[0]

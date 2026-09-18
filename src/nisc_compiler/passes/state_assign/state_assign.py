@@ -14,9 +14,6 @@ class ASAPStateAssignPass(StateAssignBase):
     name = "state_assign"
  
     def run(self, cdfg: nx.DiGraph, context: CompileContext) -> nx.DiGraph:
-        if context.profile == "int32":
-            from .int32 import schedule_allocate
-            return schedule_allocate(cdfg, context)
         cdfg, reg_map, imm_map, spill_map, spill_base_reg, iters = iterative_schedule(
             cdfg,
             context.operators,

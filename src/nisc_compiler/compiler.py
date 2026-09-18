@@ -37,8 +37,6 @@ class NISCCompiler:
         num_registers: int = 32,
         num_imm_registers: int = 32,
         reg_width: int = 32,       # ← 追加
-        profile: str = "int32",
-        memory_words: int = 256,
     ) -> "NISCCompiler":
         """デフォルト設定でコンパイラを作成する。"""
         from nisc_compiler.passes.c_to_mlir.c_parser import CToMLIRPass
@@ -52,8 +50,6 @@ class NISCCompiler:
             num_registers=num_registers,
             num_imm_registers=num_imm_registers,
             reg_width=reg_width,   # ← 追加
-            profile=profile,
-            memory_words=memory_words,
         )
 
         passes = [
@@ -103,22 +99,6 @@ class NISCCompiler:
         Returns:
             コンパイル結果が入ったCompileContext
         """
-        # A failed or repeated compilation must not expose stale success data.
-        from dataclasses import replace
-        self.context = replace(
-            self.context, mlir_text="", reg_map={}, imm_map={}, spill_map={},
-            spill_base_reg=-1, iterations=0, program_scala="", init_txt="",
-            unmatched_ops=[], pass_times={}, extra={},
-        )
-        if self.context.profile not in ("int32", "legacy"):
-            raise ValueError("Unknown compilation profile")
-        if self.context.profile == "int32":
-            if self.context.reg_width != 32:
-                raise ValueError("int32 profile requires reg_width=32")
-            for name in ("num_registers", "num_imm_registers", "memory_words"):
-                value = getattr(self.context, name)
-                if type(value) is not int or value < 1:
-                    raise ValueError(f"{name} must be a positive integer")
         self.context.source_file = source_file
         self.context.c_source = c_source
 
@@ -128,8 +108,6 @@ class NISCCompiler:
             cdfg = pass_.run(cdfg, self.context)
             t1 = time.perf_counter()
             self.context.pass_times[pass_.name] = round(t1 - t0, 4)
-
-        self.context.extra['cdfg'] = cdfg
 
         return self.context
     
@@ -145,7 +123,7 @@ class NISCCompiler:
 
     def load_operators(self, path: str, **kwargs):
         """演算器定義ファイルを読み込んで追加する。"""
-        with open(path, encoding="utf-8") as f:
+        with open(path) as f:
             source = f.read()
         
         # kwargsをグローバル変数として定義してから実行

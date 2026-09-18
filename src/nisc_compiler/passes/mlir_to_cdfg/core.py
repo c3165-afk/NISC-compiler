@@ -17,22 +17,8 @@ import networkx as nx
 
 from xdsl.context import Context
 from xdsl.parser import Parser
-from xdsl.dialects import arith, scf, memref, func, math, builtin, cf
+from xdsl.dialects import arith, scf, memref, func, math, builtin
 from xdsl.ir import Operation, Block
-
-
-def integer_comparison_predicate(op: Operation) -> str:
-    """通常経路と構造化CFG経路で共有する、比較条件の読み出し。"""
-    if op.name != 'arith.cmpi':
-        raise ValueError('Only integer comparisons have a supported comparator contract')
-    if len(op.operands) != 2 or any(str(v.type) != 'i32' for v in op.operands):
-        raise ValueError('Integer comparison requires two i32 operands')
-    predicates = {0: 'eq', 1: 'ne', 2: 'slt', 3: 'sle', 4: 'sgt', 5: 'sge',
-                  6: 'ult', 7: 'ule', 8: 'ugt', 9: 'uge'}
-    try:
-        return predicates[int(op.predicate.value.data)]
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise ValueError('Missing or invalid integer comparison predicate') from exc
 
 
 # 演算器を使わない命令
@@ -69,7 +55,7 @@ class MLIRToCDFG:
         self._alloca_map: dict[str, int] = {}  # ← 追加 ssa名→SRAMアドレス
         self._alias_map: dict[str, str] = {}   # ← 追加 index_castエイリアス
 
-    def lower(self, mlir_text: str, stable_names: bool = False) -> nx.DiGraph:
+    def lower(self, mlir_text: str) -> nx.DiGraph:
         ctx = Context()
         ctx.load_dialect(builtin.Builtin)
         ctx.load_dialect(func.Func)
@@ -77,29 +63,9 @@ class MLIRToCDFG:
         ctx.load_dialect(scf.Scf)
         ctx.load_dialect(memref.MemRef)
         ctx.load_dialect(math.Math)
-        ctx.load_dialect(cf.Cf)
 
         parser = Parser(ctx, mlir_text)
         module = parser.parse_module()
-        if stable_names:
-            module.verify()
-            # xDSL name_hint is not a unique SSA identifier (e.g. tmp_0 and
-            # tmp_1 both have hint "tmp"). Assign by value identity before use.
-            counter = 0
-            for operation in module.walk():
-                values = list(operation.results)
-                for region in operation.regions:
-                    for block in region.blocks:
-                        values.extend(block.args)
-                for value in values:
-                    value.name_hint = f'niscv{counter}'
-                    counter += 1
-            if any(operation.name in ('cf.br', 'cf.cond_br') for operation in module.walk()):
-                from .structured import lower_cfg
-                return lower_cfg(module)
-            if any(operation.name == 'scf.if' for operation in module.walk()):
-                from .structured import lower_structured
-                return lower_structured(module)
 
         for op in module.body.block.ops:
             if op.name == "func.func":
@@ -352,8 +318,6 @@ class MLIRToCDFG:
         )
         if const_value is not None:
             node_attrs['const_value'] = const_value
-        if op_name in ('arith.cmpi', 'arith.cmpf'):
-            node_attrs['predicate'] = integer_comparison_predicate(op)
 
         self._graph.add_node(node_id, **node_attrs)
 
@@ -652,7 +616,6 @@ class MLIRToCDFG:
                 operands=[iv_name, ub_i32],
                 results=[cmp_result],
                 mlir_typ="i1",
-                predicate="slt",  # scf.forの合成条件も比較条件を明示する
                 operand_typ="i32",  # ← 追加
             )
             self._value_to_node[cmp_result] = cmp_id
@@ -791,9 +754,9 @@ class MLIRToCDFG:
 # ----------------------------------------------------------------
 # 公開API
 # ----------------------------------------------------------------
-def lower_mlir(mlir_text: str, stable_names: bool = False) -> nx.DiGraph:
+def lower_mlir(mlir_text: str) -> nx.DiGraph:
     lowerer = MLIRToCDFG()
-    cdfg = lowerer.lower(mlir_text, stable_names=stable_names)
+    cdfg = lowerer.lower(mlir_text)
     cdfg.graph['alloca_map'] = lowerer._alloca_map  # ← グラフ属性として保存
     return cdfg
 

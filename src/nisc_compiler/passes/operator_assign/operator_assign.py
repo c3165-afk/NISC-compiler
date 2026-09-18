@@ -13,13 +13,7 @@ class VF2OperatorAssignPass(OperatorAssignBase):
     name = "operator_assign"
 
     def run(self, cdfg, context):
-        operators = context.operators
-        if context.profile == "int32":
-            from nisc_compiler.passes.state_assign.int32 import select_operators
-            operators = select_operators(operators)
-            context.extra['int32_operators'] = operators
-        cdfg, results, unmatched = match_all(cdfg, operators)
-        context.unmatched_ops = unmatched
+        cdfg, results, unmatched = match_all(cdfg, context.operators)
         if unmatched:
             raise RuntimeError(
                 f"Unmatched operations: {unmatched}\n"

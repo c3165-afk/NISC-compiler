@@ -11,7 +11,7 @@ from nisc_compiler.passes.state_assign.alap import ALAPStateAssignPass
 # ================================================================
 
 # ベンチマーク
-BENCHMARKS = ['bicg']
+BENCHMARKS = ['a']
 
 # DP設定
 NUM_REGISTERS = 32

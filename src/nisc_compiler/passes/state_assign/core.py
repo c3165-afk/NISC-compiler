@@ -22,184 +22,6 @@ class ScheduleError(Exception):
     pass
 
 
-def verify_completion(graph, context):
-    """A09: check end-of-cycle commits before transfer, use and final done.
-
-    For launch s and latency L, commit is at the end of s+L-1; a consumer
-    can launch at s+L. Across blocks, state labels are not elapsed time.
-    """
-    done = graph.graph.get('done_state')
-    if type(done) is not int or done < 1:
-        raise ScheduleError('Invalid done state')
-    blocks = graph.graph.get('blocks', {})
-    owners = {}
-    for bb, data in graph.nodes(data=True):
-        if data['type'] == 'bb':
-            for _, n, edge in graph.out_edges(bb, data=True):
-                if edge.get('label') == 'contains':
-                    if n in owners:
-                        raise ScheduleError('Operation belongs to multiple basic blocks')
-                    owners[n] = bb
-    occupied = set()
-    for bb, meta in blocks.items():
-        start, end = meta.get('start'), meta.get('end')
-        if type(start) is not int or type(end) is not int or not 0 <= start <= end < done:
-            raise ScheduleError('Invalid basic block completion range')
-        states = set(range(start, end + 1))
-        if states & occupied:
-            raise ScheduleError('Overlapping basic block states')
-        occupied |= states
-    if blocks and (blocks[graph.graph['entry']]['start'] != 0
-                   or blocks[graph.graph['exit']]['end'] + 1 != done):
-        raise ScheduleError('Entry/exit state does not match execution boundaries')
-    op_map = {op.name: op for op in context.extra['int32_operators']}
-    completions = {}
-    producers = {}
-    for n, data in graph.nodes(data=True):
-        for s in data.get('results', []):
-            producers[s] = n
-        if data['type'] != 'op':
-            continue
-        start, latency = data.get('state'), data.get('latency')
-        operator = op_map.get(data.get('assigned_op'))
-        if (type(start) is not int or start < 0 or type(latency) is not int or latency < 1
-                or operator is None or latency != operator.latency):
-            raise ScheduleError('Invalid operation launch time or latency')
-        if n not in owners or (blocks and owners[n] not in blocks):
-            raise ScheduleError('Scheduled operation has no basic block')
-        finish = start + latency
-        if finish > done:
-            raise ScheduleError('done precedes operation completion')
-        if blocks:
-            meta = blocks[owners[n]]
-            if start < meta['start'] or finish > meta['end'] + 1:
-                raise ScheduleError('Control transfer before operation completion')
-        completions[n] = finish
-    stores = [n for n, d in graph.nodes(data=True) if d['op_name'] == 'memref.store']
-    store = graph.graph.get('return_store')
-    if stores != [store] or store not in completions:
-        raise ScheduleError('Expected exactly one identified return STORE')
-    if completions[store] != done:
-        raise ScheduleError('done must immediately follow return STORE completion')
-    if blocks and owners[store] != graph.graph['exit']:
-        raise ScheduleError('Return STORE must belong to the common exit')
-    # Reconstruct operand timing even if a data edge was accidentally lost.
-    for n, data in graph.nodes(data=True):
-        if data['type'] != 'op':
-            continue
-        for s in data['operands']:
-            p = producers.get(s)
-            if p is None:
-                raise ScheduleError(f'Undefined scheduled operand: {s}')
-            if p in completions and (not blocks or owners[p] == owners[n]):
-                if completions[p] > data['state']:
-                    raise ScheduleError(f'Operand used before completion: {s}')
-
-
-def schedule_cfg(graph, context):
-    """Lay out cyclic CFG blocks once; FSM back edges perform the iterations."""
-    from nisc_compiler.passes.register_allocate.allocator import allocate_cfg, AllocationError
-    blocks = graph.graph['blocks']
-    cfg = nx.DiGraph((bb, s) for bb, m in blocks.items() for s in m['successors'])
-    cfg.add_nodes_from(blocks)
-    order = list(nx.dfs_preorder_nodes(cfg, graph.graph['entry']))
-    if set(order) != set(blocks):
-        raise ScheduleError('Unreachable CFG block')
-    order.remove(graph.graph['exit'])
-    order.append(graph.graph['exit'])
-    owners = {n: bb for bb in blocks for _, n, e in graph.out_edges(bb, data=True)
-              if e.get('label') == 'contains'}
-    # State labels are locations, not time across loop iterations. Only local
-    # dependencies constrain a block's schedule; dominance checks the others.
-    local = graph.copy()
-    local.remove_edges_from([(u, v) for u, v, e in graph.edges(data=True)
-                             if e['type'] in ('data', 'order') and owners.get(u) != owners.get(v)])
-    offset = 0
-    for bb in order:
-        members = [n for n, owner in owners.items() if owner == bb]
-        condition = blocks[bb]['condition']
-        if condition:
-            cmp = next(n for n in members if condition in graph.nodes[n]['results'])
-            for n in members:
-                if n != cmp and graph.nodes[n]['type'] == 'op':
-                    local.add_edge(n, cmp, type='order')
-                    graph.add_edge(n, cmp, type='order')
-        for n in members:
-            if graph.nodes[n]['op_name'] == 'nisc.phi':
-                local.nodes[n].update(state=offset, latency=0)
-        end = max(offset, schedule_bb(local, bb, context.extra['int32_operators'], offset))
-        blocks[bb].update(start=offset, end=end)
-        for n in members:
-            graph.nodes[n].update(local.nodes[n])
-        offset = end + 1
-    graph.graph['done_state'] = offset
-    immediates, imm_map = [], {}
-    for _, d in graph.nodes(data=True):
-        if d['op_name'] == 'arith.constant':
-            value = d['const_value']
-            if not -(1 << 31) <= value < (1 << 31):
-                raise AllocationError('Constant outside int32 range')
-            if value not in immediates:
-                immediates.append(value)
-            imm_map.update((s, immediates.index(value)) for s in d['results'])
-    if len(immediates) > context.num_imm_registers:
-        raise AllocationError('Immediate register capacity exceeded')
-    context.imm_map = imm_map
-    context.extra['imm_values'] = immediates
-    context.reg_map = allocate_cfg(graph, context)
-    context.iterations = 1
-    for _, d in graph.nodes(data=True):
-        for field, prefix in (('operands', 'operand'), ('results', 'result')):
-            d[prefix + '_regs'] = [imm_map[s] if s in imm_map else context.reg_map.get(s) for s in d[field]]
-            d[prefix + '_reg_types'] = ['imm' if s in imm_map else 'gpr' if s in context.reg_map else 'flag' for s in d[field]]
-    verify_cfg_schedule(graph, context)
-    return graph
-
-
-def verify_cfg_schedule(graph, context):
-    from .int32 import RESOURCE, verify_cfg
-    from nisc_compiler.passes.register_allocate.allocator import cfg_interference, AllocationError
-    verify_completion(graph, context)
-    verify_cfg(graph, context)
-    blocks = graph.graph['blocks']
-    owners = {n: bb for bb in blocks for _, n, e in graph.out_edges(bb, data=True)
-              if e.get('label') == 'contains'}
-    op_map = {o.name: o for o in context.extra['int32_operators']}
-    reservations = set()
-    occupied_blocks = set()
-    for bb, meta in blocks.items():
-        if not 0 <= meta['start'] <= meta['end'] < graph.graph['done_state']:
-            raise ScheduleError('Invalid CFG block state range')
-        states = set(range(meta['start'], meta['end'] + 1))
-        if occupied_blocks & states:
-            raise ScheduleError('Overlapping CFG block states')
-        occupied_blocks |= states
-    for n, d in graph.nodes(data=True):
-        if d['type'] != 'op':
-            continue
-        if d['latency'] != op_map[d['assigned_op']].latency or d['latency'] < 1:
-            raise ScheduleError('Invalid scheduled latency')
-        for t in range(d['state'], d['state'] + d['latency']):
-            key = (t, RESOURCE[d['op_name']])
-            if key in reservations:
-                raise ScheduleError('Physical resource conflict')
-            reservations.add(key)
-    for u, v, edge in graph.edges(data=True):
-        a, b = graph.nodes[u], graph.nodes[v]
-        if (edge['type'] in ('order', 'data') and owners.get(u) == owners.get(v)
-                and a['type'] == b['type'] == 'op'
-                and a['state'] + a['latency'] > b['state']):
-            raise ScheduleError('Local dependency violated')
-    interference, values = cfg_interference(graph, context.imm_map)
-    aliases = graph.graph.get('aliases', {})
-    for s in values:
-        r = context.reg_map.get(s, -1)
-        if not 1 <= r < context.num_registers or r != context.reg_map.get(aliases.get(s, s)):
-            raise AllocationError('Invalid CFG register or edge-copy alias')
-    if any(context.reg_map[a] == context.reg_map[b] for a, b in interference.edges):
-        raise AllocationError('Live CFG values share a register')
-
-
 def _get_bb_subgraph(cdfg: nx.DiGraph, bb_id: int) -> list[int]:
     """BBノードに含まれるopノードのリストを返す。"""
     op_nodes = []
@@ -218,7 +40,7 @@ def _data_predecessors(cdfg: nx.DiGraph, node_id: int) -> list[int]:
     """データエッジで繋がった前段ノードのリストを返す。"""
     preds = []
     for src, _, data in cdfg.in_edges(node_id, data=True):
-        if data.get('type') in ('data', 'order'):
+        if data.get('type') == 'data':
             preds.append(src)
     return preds
 
@@ -287,8 +109,6 @@ def schedule_bb(
         operator = op_map.get(assigned_op)
         if operator is None:
             raise ScheduleError(f"Operator '{assigned_op}' not found in dp")
-        if type(operator.latency) is not int or operator.latency < 1 or operator.count < 1:
-            raise ScheduleError(f"Invalid timing/capacity for {assigned_op}")
 
         group = data.get('match_group')
 
@@ -316,10 +136,9 @@ def schedule_bb(
         state = earliest
         # resource が設定されていればresourceでカウント、なければassigned_opで
         resource_key = operator.resource if operator.resource else assigned_op
-        occupy_cycles = 1 if operator.pipelined else operator.latency
         while True:
-            if all(state_usage[s][resource_key] < operator.count
-                   for s in range(state, state + occupy_cycles)):
+            current_count = state_usage[state][resource_key]
+            if current_count < operator.count:
                 break
             state += 1
         # グループ内の全ノードに同じステートを割り当て
@@ -335,7 +154,7 @@ def schedule_bb(
 
     # このBBの最終ステートを返す
     states = [
-        cdfg.nodes[n]['state'] + cdfg.nodes[n].get('latency', 1) - 1
+        cdfg.nodes[n].get('state', state_offset - 1)
         for n in op_nodes
         if cdfg.nodes[n].get('state') is not None
     ]
