@@ -4,8 +4,8 @@ scheduler.py: CDFGへのASAPスケジューリング
 各演算ノードにステート番号を割り当てる。
 
 制約:
-  1. データ依存: A→BのデータエッジがあればAのステート < Bのステート
-  2. 演算器数:   同じステートに同じ演算器はcount個まで
+  1. 依存関係:   別の配置単位へ渡す値は、生成元の完了後に使用する
+  2. 演算器数:   占有期間の全サイクルで、同じ資源の使用数をcount以下にする
   3. BBの境界:   BBが違えば必ず別のステートグループ
 
 ノードに追加される属性:
@@ -52,7 +52,7 @@ def schedule_bb(
     state_offset: int = 0,
 ) -> int:
     """
-    1つのBBをASAPスケジューリングする。
+    1つのBBを、占有期間と最長依存鎖を考慮してASAP配置する。
 
     Args:
         cdfg:         対象のCDFG
@@ -61,104 +61,126 @@ def schedule_bb(
         state_offset: このBBのステート番号の開始オフセット
 
     Returns:
-        このBBが使った最後のステート番号
+        このBBの演算が完了する最後のステート番号（開始 + latency - 1）
     """
     op_nodes = _get_bb_subgraph(cdfg, bb_id)
     if not op_nodes:
         return state_offset - 1
 
-    # 演算器名 → Operatorのマッピング
-    op_map: dict[str, Operator] = {op.name: op for op in operators}
+    op_map = {op.name: op for op in operators}
 
-    # ステートごとの演算器使用数: {state: {op_name: count}}
-    state_usage: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # 変更: ノードの固定順ではなく、複合演算をまとめた依存グラフで候補を選ぶ。
+    # match_groupのない演算は、それぞれ独立した配置単位として扱う。
+    groups = defaultdict(list)
+    owner = {}
+    for nid in op_nodes:
+        data = cdfg.nodes[nid]
+        group = data.get('match_group')
+        key = ('group', group) if group is not None else ('node', nid)
+        groups[key].append(nid)
+        owner[nid] = key
 
-    # トポロジカル順序でノードを処理（データ依存順）
-    # op_nodes内でのトポロジカルソート
-    subgraph = cdfg.subgraph(op_nodes)
-    try:
-        topo_order = list(nx.topological_sort(subgraph))
-    except nx.NetworkXUnfeasible:
+    # 変更: グループ化で内部の循環が隠れないよう、元の依存グラフも検査する。
+    node_dependencies = nx.DiGraph()
+    node_dependencies.add_nodes_from(op_nodes)
+    node_dependencies.add_edges_from(
+        (u, v) for u, v, edge in cdfg.edges(data=True)
+        if u in owner and v in owner and edge.get('type') in ('data', 'order'))
+    if not nx.is_directed_acyclic_graph(node_dependencies):
         raise ScheduleError(f"Cycle detected in BB {bb_id}")
 
-    # match_groupごとにノードをグループ化
-    # 同じmatch_groupのノードは同じステートに割り当てる
-    group_to_nodes: dict[int, list[int]] = defaultdict(list)
-    ungrouped: list[int] = []
-    for node_id in topo_order:
-        data = cdfg.nodes[node_id]
-        if data.get('assigned_op') is None:
-            continue
-        group = data.get('match_group')
-        if group is not None:
-            group_to_nodes[group].append(node_id)
-        else:
-            ungrouped.append(node_id)
-
-    # グループ単位でスケジューリング
-    # トポロジカル順序でグループの代表ノード（先頭）を処理
-    scheduled_groups: set[int] = set()
-
-    for node_id in topo_order:
-        data = cdfg.nodes[node_id]
-        assigned_op = data.get('assigned_op')
-
-        if assigned_op is None:
-            continue
-
-        operator = op_map.get(assigned_op)
+    dependencies = nx.DiGraph()
+    dependencies.add_nodes_from(groups)
+    group_ops = {}
+    capacity = {}
+    release = dict.fromkeys(groups, state_offset)
+    rank = {key: i for i, key in enumerate(groups)}
+    for key, members in groups.items():
+        names = {cdfg.nodes[n].get('assigned_op') for n in members}
+        if len(names) != 1 or None in names:
+            raise ScheduleError(f"Invalid operator assignment in BB {bb_id}: {members}")
+        name = next(iter(names))
+        operator = op_map.get(name)
         if operator is None:
-            raise ScheduleError(f"Operator '{assigned_op}' not found in dp")
-
-        group = data.get('match_group')
-
-        # グループ済みならスキップ
-        if group is not None and group in scheduled_groups:
-            continue
-
-        # このノードが属するグループの全ノードを取得
-        group_nodes = group_to_nodes[group] if group is not None else [node_id]
-
-        # グループ全体のデータ依存から最早ステートを計算
-        earliest = state_offset
-        for gnode_id in group_nodes:
-            for pred_id in _data_predecessors(cdfg, gnode_id):
-                pred_state = cdfg.nodes[pred_id].get('state')
-                # 同じグループ内のノードは除外
-                pred_group = cdfg.nodes[pred_id].get('match_group')
-                if pred_group is not None and pred_group == group:
+            raise ScheduleError(f"Operator '{name}' not found in dp")
+        # 変更: 不正な占有期間・個数による無限探索や予約の不整合を防ぐ。
+        if (type(operator.latency) is not int or operator.latency < 1
+                or type(operator.count) is not int or operator.count < 1):
+            raise ScheduleError(f"Invalid latency/count for operator '{name}'")
+        if any(cdfg.nodes[n].get('latency') != operator.latency for n in members):
+            raise ScheduleError(f"Latency mismatch for operator '{name}'")
+        resource = operator.resource or name
+        if resource in capacity and capacity[resource] != operator.count:
+            raise ScheduleError(f"Inconsistent count for shared resource '{resource}'")
+        capacity[resource] = operator.count
+        group_ops[key] = operator
+        for nid in members:
+            for pred, _, edge in cdfg.in_edges(nid, data=True):
+                # データ依存に加え、明示された実行順序の辺も保持する。
+                if edge.get('type') not in ('data', 'order'):
                     continue
-                if pred_state is not None:
-                    pred_latency = cdfg.nodes[pred_id].get('latency', 1)
-                    earliest = max(earliest, pred_state + pred_latency)
+                if pred in owner:
+                    if owner[pred] != key:
+                        dependencies.add_edge(owner[pred], key)
+                else:
+                    # BB外の既存の依存時刻を保持する。BBをまたぐ移動は行わない。
+                    previous = cdfg.nodes[pred]
+                    if previous.get('state') is not None:
+                        release[key] = max(release[key], previous['state']
+                                           + previous.get('latency', 1))
+    try:
+        topology = list(nx.topological_sort(dependencies))
+    except nx.NetworkXUnfeasible:
+        raise ScheduleError(f"Cycle between operation groups in BB {bb_id}")
 
-        # 演算器数制約を満たす最早ステートを探す
-        state = earliest
-        # resource が設定されていればresourceでカウント、なければassigned_opで
-        resource_key = operator.resource if operator.resource else assigned_op
-        while True:
-            current_count = state_usage[state][resource_key]
-            if current_count < operator.count:
-                break
-            state += 1
-        # グループ内の全ノードに同じステートを割り当て
-        for gnode_id in group_nodes:
-            cdfg.nodes[gnode_id]['state'] = state
-        # 演算器の占有を記録
-        occupy_cycles = 1 if operator.pipelined else operator.latency
-        for s in range(state, state + occupy_cycles):
-            state_usage[s][resource_key] += 1
+    # 変更: 自分から後続の終端までの最長レイテンシを優先度とする。
+    # 同じ時刻に配置できる候補では、残りの依存鎖が長い演算を先に選ぶ。
+    priority = {}
+    for key in reversed(topology):
+        priority[key] = group_ops[key].latency + max(
+            (priority[child] for child in dependencies.successors(key)), default=0)
 
-        if group is not None:
-            scheduled_groups.add(group)
+    state_usage = defaultdict(lambda: defaultdict(int))
+    remaining = dict(dependencies.in_degree())
+    ready = {key for key in groups if remaining[key] == 0}
+    finish = {}
+    while ready:
+        candidates = []
+        for key in ready:
+            operator = group_ops[key]
+            resource = operator.resource or operator.name
+            # 既存のpipelined=Trueは開始間隔1という契約を維持する。
+            # 結果の利用可能時刻は、パイプラインでもlatency後とする。
+            duration = 1 if operator.pipelined else operator.latency
+            state = max(release[key], max(
+                (finish[pred] for pred in dependencies.predecessors(key)),
+                default=state_offset))
+            # 変更: 開始時点だけでなく占有期間の全サイクルで空きを確認する。
+            # 将来の予約と重なる場合は、期間全体が入る位置まで進める。
+            while any(state_usage[t][resource] >= capacity[resource]
+                      for t in range(state, state + duration)):
+                state += 1
+            candidates.append((state, -priority[key], rank[key], key))
 
-    # このBBの最終ステートを返す
-    states = [
-        cdfg.nodes[n].get('state', state_offset - 1)
-        for n in op_nodes
-        if cdfg.nodes[n].get('state') is not None
-    ]
-    return max(states) if states else state_offset - 1
+        # 変更: 最も早い空きに入る候補を選び、同時刻なら最長依存鎖を優先。
+        # rankを最後の比較条件にし、同条件での配置を再現可能にする。
+        state, _, _, key = min(candidates)
+        operator = group_ops[key]
+        resource = operator.resource or operator.name
+        duration = 1 if operator.pipelined else operator.latency
+        for nid in groups[key]:
+            cdfg.nodes[nid]['state'] = state
+        for t in range(state, state + duration):
+            state_usage[t][resource] += 1
+        finish[key] = state + operator.latency
+        ready.remove(key)
+        for child in dependencies.successors(key):
+            remaining[child] -= 1
+            if remaining[child] == 0:
+                ready.add(child)
+
+    # 変更: BBの使用期間には、最後の演算の開始だけでなく完了までを含める。
+    return max(finish.values()) - 1
 
 
 def _get_ctrl_children(cdfg: nx.DiGraph, bb_id: int) -> dict[str, list[int]]:
