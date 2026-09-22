@@ -10,7 +10,11 @@ lowering.py: MLIRテキスト → networkx CDFG（Control Data Flow Graph）変�
 エッジの種類:
   type="data"  SSA変数の依存関係
   type="ctrl"  制御フロー（BB間の遷移・包含関係）
-  label:       "then"/"else"/"body"/"cond"/"exit"/"back" で遷移の種類を表す
+  label:       "next"/"then"/"else"/"body"/"cond"/"incr"/"exit"/"back" はBB間の遷移
+               "contains" はBBへの所属（実行順序を表す遷移とは区別する）
+
+変更: 各処理単位の入口にunit_kindとbb_init/bb_body/bb_exit等を記録する。
+      空の入口・出口もCDFGに残す。ステート割り当てやFSM生成は後段で扱う。
 """
 from __future__ import annotations
 import networkx as nx
@@ -71,135 +75,9 @@ class MLIRToCDFG:
             if op.name == "func.func":
                 self._process_func(op)
 
-        # bb_exitから外側ループのbb_incrへのエッジを後から張る
-        # （bb_incrはforの処理が終わってから作られるため）
-        self._fix_exit_edges()
-        self._fix_body_edges()
-
+        # 変更: 出口の接続は各ブロックを読む時点で行う。
+        # 後から「次のfor」を探すと、その間の通常演算やifを飛び越えるため廃止した。
         return self._graph
-
-    def _fix_exit_edges(self):
-        """
-        bb_exitから外側ループのbb_incrへのエッジを張る。
-        全forの処理が終わった後に呼ぶ。
-        """
-        # forノードのリストを収集（bb_incrを持つもの）
-        for_nodes = [
-            nid for nid, data in self._graph.nodes(data=True)
-            if data.get('op_name') == 'scf.for' and 'bb_incr' in data
-        ]
-
-        for for_nid in for_nodes:
-            bb_exit = self._graph.nodes[for_nid].get('bb_exit')
-            bb_incr = self._graph.nodes[for_nid].get('bb_incr')
-            if bb_exit is None or bb_incr is None:
-                continue
-
-            # このforを含む外側のforを探す
-            # bb_bodyが親forのbb_bodyに含まれているかを確認
-            parent_for = self._find_parent_for(for_nid, for_nodes)
-            if parent_for is not None:
-                parent_incr = self._graph.nodes[parent_for].get('bb_incr')
-                if parent_incr is not None and not self._graph.has_edge(bb_exit, parent_incr):
-                    self._graph.add_edge(bb_exit, parent_incr, type="ctrl", label="next")
-            else:
-                # 最外ループのbb_exit
-                # 同じ親BBに次のforループがあればそのbb_initに繋ぐ
-                # なければdoneに繋ぐ
-                next_for = self._find_next_for(for_nid)
-                if next_for is not None:
-                    next_init = self._graph.nodes[next_for].get('bb_init')
-                    if next_init is not None and not self._graph.has_edge(bb_exit, next_init):
-                        self._graph.add_edge(bb_exit, next_init, type="ctrl", label="next")
-                else:
-                    # doneノードへ
-                    done_nodes = [
-                        nid for nid, d in self._graph.nodes(data=True)
-                        if d.get('op_name') == 'done'
-                    ]
-                    for done_nid in done_nodes:
-                        if not self._graph.has_edge(bb_exit, done_nid):
-                            self._graph.add_edge(bb_exit, done_nid, type="ctrl", label="next")
-
-    def _fix_body_edges(self):
-        """
-        bb_bodyの中にネストしたforがある場合、
-        bb_bodyからネストしたforのbb_initへのエッジを張る。
-        （bb_initでivがリセットされる）
-        """
-        edges_to_add = []
-        for bb_id, data in self._graph.nodes(data=True):
-            if data.get('op_name') != 'bb_body':
-                continue
-            for _, dst, edata in self._graph.out_edges(bb_id, data=True):
-                if edata.get('label') == 'contains':
-                    dst_data = self._graph.nodes[dst]
-                    if dst_data.get('op_name') == 'scf.for':
-                        bb_init = dst_data.get('bb_init')  # ← bb_condをbb_initに変更
-                        if bb_init is not None:
-                            if not self._graph.has_edge(bb_id, bb_init):
-                                edges_to_add.append((bb_id, bb_init))
-        for src, dst in edges_to_add:
-            self._graph.add_edge(src, dst, type="ctrl", label="body")  # ← containsをbodyに変更
-
-    def _find_parent_for(self, for_nid: int, for_nodes: list) -> int | None:
-        """
-        指定したforノードを含む外側のforノードを返す。
-        bb_bodyのcontainsエッジを辿って探す。
-        """
-        bb_cond = self._graph.nodes[for_nid].get('bb_cond')
-        if bb_cond is None:
-            return None
-
-        # bb_condに入ってくるエッジの元をたどって外側forを探す
-        for candidate in for_nodes:
-            if candidate == for_nid:
-                continue
-            candidate_body = self._graph.nodes[candidate].get('bb_body')
-            if candidate_body is None:
-                continue
-            # candidate_bodyがfor_nidのbb_condの祖先かを確認
-            # bb_bodyからcontainsエッジを辿ってbb_condを探す
-            for _, dst, edata in self._graph.out_edges(candidate_body, data=True):
-                if edata.get('label') == 'contains' and dst == for_nid:
-                    return candidate
-
-        return None
-    
-    def _find_next_for(self, for_nid: int) -> int | None:
-        """
-        同じ親BBに含まれる次のforループを返す。
-        """
-        # このforを含む親BBを探す
-        parent_bb = None
-        for nid, data in self._graph.nodes(data=True):
-            if data.get('type') != 'bb':
-                continue
-            for _, dst, edata in self._graph.out_edges(nid, data=True):
-                if edata.get('label') == 'contains' and dst == for_nid:
-                    parent_bb = nid
-                    break
-            if parent_bb is not None:
-                break
-
-        if parent_bb is None:
-            return None
-
-        # 親BBに含まれるforノードを順番に取得
-        sibling_fors = []
-        for _, dst, edata in self._graph.out_edges(parent_bb, data=True):
-            if edata.get('label') == 'contains':
-                dst_data = self._graph.nodes[dst]
-                if dst_data.get('op_name') == 'scf.for':
-                    sibling_fors.append(dst)
-
-        # for_nidの次のforを返す
-        sibling_fors.sort()  # ノードIDでソート（生成順）
-        for i, nid in enumerate(sibling_fors):
-            if nid == for_nid and i + 1 < len(sibling_fors):
-                return sibling_fors[i + 1]
-
-        return None
 
     # ----------------------------------------------------------------
     # 関数処理
@@ -218,20 +96,72 @@ class MLIRToCDFG:
                     )
                     self._value_to_node[id(arg)] = node_id
 
-                bb_id = self._new_bb("entry")
-                self._process_block(block, bb_id)
+                # 変更: 外側の演算を一つのbb_entryに集めず、処理単位ごとに分割する。
+                bb_init, bb_exit = self._process_block(block, allow_return=True)
+                self._graph.nodes[bb_init]['function_entry'] = True
+                self._graph.nodes[bb_exit]['function_exit'] = True
+                # 関数引数は実行開始時に利用できる値として、最初の入口に所属させる。
+                for arg in block.args:
+                    arg_id = self._value_to_node[id(arg)]
+                    self._graph.add_edge(bb_init, arg_id, type="ctrl", label="contains")
 
     # ----------------------------------------------------------------
     # ブロック処理
     # ----------------------------------------------------------------
-    def _process_block(self, block: Block, bb_id: int):
-        for op in block.ops:
-            self._process_op(op, bb_id)
+    def _process_block(
+        self, block: Block, bb_id: int | None = None, *, allow_return: bool = False,
+    ) -> tuple[int, int]:
+        # 変更: 通常演算の連続区間と制御構造を分け、入口・出口をソース順につなぐ。
+        # bb_idは親のbody/cond。入れ子がなければ従来どおりそこに演算を追加する。
+        first_bb = bb_id
+        last_bb = bb_id
+        current_body = bb_id
+        ops = list(block.ops)
+        for index, op in enumerate(ops):
+            if op.name in ("scf.for", "scf.while", "scf.if", "func.return"):
+                # 変更: 今回は関数末尾のreturnのみ対応し、早期returnは実装しない。
+                if op.name == "func.return" and (not allow_return or index != len(ops) - 1):
+                    raise ValueError("途中のreturnには未対応です。関数末尾のreturnのみ使用できます。")
+                bb_init = self._new_bb("init")
+                node_id = self._process_op(op, bb_init)
+                bb_exit = self._graph.nodes[node_id]['bb_exit']
+                if last_bb is not None:
+                    self._graph.add_edge(last_bb, bb_init, type="ctrl", label="next")
+                if first_bb is None:
+                    first_bb = bb_init
+                last_bb = bb_exit
+                current_body = None
+            else:
+                if current_body is None:
+                    bb_init, current_body, bb_exit = self._new_plain_unit()
+                    if last_bb is not None:
+                        self._graph.add_edge(last_bb, bb_init, type="ctrl", label="next")
+                    if first_bb is None:
+                        first_bb = bb_init
+                    last_bb = bb_exit
+                self._process_op(op, current_body)
+
+        # 空のブロックにも入口から出口までの経路を残す。
+        if first_bb is None:
+            first_bb, _, last_bb = self._new_plain_unit()
+        return first_bb, last_bb
+
+    def _new_plain_unit(self) -> tuple[int, int, int]:
+        # 変更: 通常演算もinit → body → exitの共通形式にする。
+        bb_init = self._new_bb("init")
+        bb_body = self._new_bb("body")
+        bb_exit = self._new_bb("exit")
+        self._graph.add_edge(bb_init, bb_body, type="ctrl", label="body")
+        self._graph.add_edge(bb_body, bb_exit, type="ctrl", label="exit")
+        self._graph.nodes[bb_init].update(
+            unit_kind="normal", bb_init=bb_init, bb_body=bb_body, bb_exit=bb_exit,
+        )
+        return bb_init, bb_body, bb_exit
 
     # ----------------------------------------------------------------
     # 命令処理
     # ----------------------------------------------------------------
-    def _process_op(self, op: Operation, bb_id: int):
+    def _process_op(self, op: Operation, bb_id: int) -> int | None:
         # memref.allocaはSRAMアドレスを割り当ててスキップ
         if op.name == "memref.alloca":
             results = [_ssa_name(v) for v in op.results]
@@ -333,15 +263,21 @@ class MLIRToCDFG:
         # BB → op の包含エッジ
         self._graph.add_edge(bb_id, node_id, type="ctrl", label="contains")
 
-        # 制御構造ごとにCFGエッジを正しく構築
+        # 変更: 制御ノードは専用入口に所属させ、BB同士の遷移を構築する。
         if op_name == "scf.while":
-            self._process_scf_while(node_id, op)
+            self._process_scf_while(node_id, op, bb_id)
         elif op_name == "scf.for":
-            self._process_scf_for(node_id, op)
+            self._process_scf_for(node_id, op, bb_id)
         elif op_name == "scf.if":
-            self._process_scf_if(node_id, op)
+            self._process_scf_if(node_id, op, bb_id)
         elif op_name == "func.return":
-            # func.returnをdoneノードに変換
+            # 変更: returnはinit → body(return) → exit(done)として管理する。
+            bb_body = self._new_bb("body")
+            bb_exit = self._new_bb("exit")
+            self._graph.remove_edge(bb_id, node_id)
+            self._graph.add_edge(bb_body, node_id, type="ctrl", label="contains")
+            self._graph.add_edge(bb_id, bb_body, type="ctrl", label="body")
+            self._graph.add_edge(bb_body, bb_exit, type="ctrl", label="exit")
             done_id = self._new_node()
             self._graph.add_node(done_id,
                 type="ctrl",
@@ -350,7 +286,11 @@ class MLIRToCDFG:
                 results=[],
                 mlir_typ="void",
             )
-            self._graph.add_edge(bb_id, done_id, type="ctrl", label="contains")
+            self._graph.add_edge(bb_exit, done_id, type="ctrl", label="contains")
+            self._graph.nodes[node_id].update(bb_init=bb_id, bb_body=bb_body, bb_exit=bb_exit)
+            self._graph.nodes[bb_id].update(
+                unit_kind="return", bb_init=bb_id, bb_body=bb_body, bb_exit=bb_exit,
+            )
         elif op_name in ("memref.load", "memref.store"):
             # 2次元配列のアドレス計算ノードを挿入
             # operands: load=[base, idx0, idx1], store=[val, base, idx0, idx1]
@@ -452,6 +392,8 @@ class MLIRToCDFG:
                     self._graph.nodes[node_id]['operands'] = [val_ssa, addr_ssa]
                     self._graph.add_edge(add2_id, node_id, type="data", ssa=addr_ssa)
 
+        return node_id
+
     def _get_memref_cols(self, typ: str) -> int | None:
         """memref<?x?xi32>等からcols（列数）を取得する。"""
         # memref<4x4xi32> → 4
@@ -485,72 +427,58 @@ class MLIRToCDFG:
     # ----------------------------------------------------------------
     # scf.while の CFG構造
     #
-    #   while → BB_init → BB_cond → BB_do → BB_incr → BB_cond（ループバック）
-    #                             ↘ BB_exit（条件が偽）
+    #   BB_init → BB_cond → BB_body → BB_cond（ループバック）
+    #                ↘ BB_exit（条件が偽）
     # ----------------------------------------------------------------
-    def _process_scf_while(self, while_id: int, op: Operation):
+    def _process_scf_while(self, while_id: int, op: Operation, bb_init: int):
         regions = list(op.regions)
-        if len(regions) < 2:
-            return
+        if len(regions) != 2:
+            raise ValueError("scf.whileには条件と本体の2つの領域が必要です。")
 
-        # BB_init: iter_argsの初期値をGPRにロード
-        bb_init = self._new_bb("init")
-        self._graph.add_edge(while_id, bb_init, type="ctrl", label="init")
-        # iter_argsのオペランド（初期値）をinit BBに包含
-        for v in op.operands:
-            src = self._value_to_node.get(id(v))
-            if src is not None:
-                self._graph.add_edge(bb_init, src, type="ctrl", label="contains")
-
-        # BB_cond: 条件ブロック（region[0]）
+        # 変更: 入力の生成元をinitに再所属させず、元のBBとデータ依存を保つ。
         bb_cond = self._new_bb("cond")
         self._graph.add_edge(bb_init, bb_cond, type="ctrl", label="cond")
         self._add_block_args(regions[0].blocks[0], bb_cond)
-        self._process_block(regions[0].blocks[0], bb_cond)
+        _, cond_end = self._process_block(regions[0].blocks[0], bb_cond)
 
-        # BB_do: doブロック（region[1]）
-        bb_do = self._new_bb("do")
-        self._add_block_args(regions[1].blocks[0], bb_do)
-        self._process_block(regions[1].blocks[0], bb_do)
-
-        # BB_exit: ループ後
+        # 変更: whileのbb_doを共通のbb_bodyに統一する。
+        bb_body = self._new_bb("body")
+        self._add_block_args(regions[1].blocks[0], bb_body)
+        _, body_end = self._process_block(regions[1].blocks[0], bb_body)
         bb_exit = self._new_bb("exit")
 
-        # CFGエッジ
-        self._graph.add_edge(bb_cond, bb_do,   type="ctrl", label="body")   # 条件が真
-        self._graph.add_edge(bb_cond, bb_exit,  type="ctrl", label="exit")   # 条件が偽
-        self._graph.add_edge(bb_do,   bb_cond,  type="ctrl", label="back")   # ループバック
+        # 入れ子がある場合も、領域の最後から分岐・ループバックする。
+        self._graph.add_edge(cond_end, bb_body, type="ctrl", label="body")
+        self._graph.add_edge(cond_end, bb_exit, type="ctrl", label="exit")
+        self._graph.add_edge(body_end, bb_cond, type="ctrl", label="back")
+        condition = list(regions[0].blocks[0].ops)[-1]
+        if condition.name == "scf.condition" and condition.operands:
+            self._graph.nodes[cond_end]['condition'] = _ssa_name(condition.operands[0])
+            self._graph.nodes[cond_end]['condition_node'] = self._value_to_node.get(id(condition.operands[0]))
 
-        self._graph.nodes[while_id]['bb_init'] = bb_init
-        self._graph.nodes[while_id]['bb_cond'] = bb_cond
-        self._graph.nodes[while_id]['bb_do']   = bb_do
-        self._graph.nodes[while_id]['bb_exit'] = bb_exit
+        self._graph.nodes[while_id].update(
+            bb_init=bb_init, bb_cond=bb_cond, bb_body=bb_body,
+            bb_do=bb_body, bb_exit=bb_exit,
+        )
+        # bb_do属性のみ後段との互換用に残し、実際のBB名はbb_bodyとする。
+        self._graph.nodes[bb_init].update(
+            unit_kind="while", bb_init=bb_init, bb_cond=bb_cond,
+            bb_body=bb_body, bb_exit=bb_exit,
+        )
 
     # ----------------------------------------------------------------
     # scf.for の CFG構造
     #
-    #   for → BB_init → BB_cond → BB_body → BB_incr → BB_cond（ループバック）
-    #                           ↘ BB_exit（ループ終了）
+    #   BB_init → BB_cond → BB_body → BB_incr → BB_cond（ループバック）
+    #                ↘ BB_exit（ループ終了）
     # ----------------------------------------------------------------
-    def _process_scf_for(self, for_id: int, op: Operation):
+    def _process_scf_for(self, for_id: int, op: Operation, bb_init: int):
         regions = list(op.regions)
-        if len(regions) < 1:
-            return
+        if len(regions) != 1:
+            raise ValueError("scf.forには本体の領域が必要です。")
 
-        # ネストしたforのスタックに積む
-        if not hasattr(self, '_for_stack'):
-            self._for_stack = []
-        self._for_stack.append(for_id)
-
-        # BB_init: lb/ub/stepをGPRにロード・ivを初期化
-        bb_init = self._new_bb("init")
-        self._graph.add_edge(for_id, bb_init, type="ctrl", label="init")
-        # forのオペランド（lb, ub, step）をinit BBに包含
-        for v in op.operands:
-            src = self._value_to_node.get(id(v))
-            if src is not None:
-                self._graph.add_edge(bb_init, src, type="ctrl", label="contains")
-
+        # 変更: bb_initは呼び出し元が作成する専用入口を使用する。
+        # lb/ub/stepの生成演算は元のBBに残し、ここではivの初期化だけを追加する。
         # scf.forのオペランドを取得
         # operands: [lb(index), ub(index), step(index), iter_args...]
         operands_list = list(op.operands)
@@ -632,11 +560,12 @@ class MLIRToCDFG:
         bb_body = self._new_bb("body")
         self._graph.add_edge(bb_cond, bb_body, type="ctrl", label="body")  # 条件が真
         self._add_block_args(regions[0].blocks[0], bb_body)
-        self._process_block(regions[0].blocks[0], bb_body)
+        _, body_end = self._process_block(regions[0].blocks[0], bb_body)
 
         # BB_incr: ivのインクリメント（iv = iv + step）
         bb_incr = self._new_bb("incr")
-        self._graph.add_edge(bb_body, bb_incr, type="ctrl", label="incr")
+        # 変更: 入れ子とその後の演算を終えた出口から更新へ進む。
+        self._graph.add_edge(body_end, bb_incr, type="ctrl", label="incr")
         self._graph.add_edge(bb_incr, bb_cond, type="ctrl", label="back")  # ループバック
 
         # bb_incrにaddiノードを追加（iv = iv + step）
@@ -681,38 +610,68 @@ class MLIRToCDFG:
         self._graph.nodes[for_id]['bb_incr'] = bb_incr
         self._graph.nodes[for_id]['bb_exit'] = bb_exit
 
-        # スタックから自分を取り出す
-        self._for_stack.pop()
-
-        # 外側ループのbb_incrへのエッジを張る
-        if self._for_stack:
-            parent_for_id = self._for_stack[-1]
-            parent_incr = self._graph.nodes[parent_for_id].get('bb_incr')
-            if parent_incr is not None:
-                self._graph.add_edge(bb_exit, parent_incr, type="ctrl", label="next")
+        self._graph.nodes[bb_init].update(
+            unit_kind="for", bb_init=bb_init, bb_cond=bb_cond,
+            bb_body=bb_body, bb_incr=bb_incr, bb_exit=bb_exit,
+        )
+        # 変更: 次の処理への接続は_process_blockが担当する。
+        # 内側forの直後にある通常演算を飛ばして外側incrへ接続しない。
 
     # ----------------------------------------------------------------
     # scf.if の CFG構造
     #
-    #   if → BB_then → BB_exit
-    #      ↘ BB_else → BB_exit
+    #   BB_init → BB_cond → BB_body(then) → BB_exit
+    #                ↘ BB_body(else) ──────↗
     # ----------------------------------------------------------------
-    def _process_scf_if(self, if_id: int, op: Operation):
+    def _process_scf_if(self, if_id: int, op: Operation, bb_init: int):
         regions = list(op.regions)
+        bb_cond = self._new_bb("cond")
+        bb_exit = self._new_bb("exit")
+        self._graph.add_edge(bb_init, bb_cond, type="ctrl", label="cond")
 
-        # BB_then（region[0]）
-        bb_then = self._new_bb("then")
-        self._graph.add_edge(if_id, bb_then, type="ctrl", label="then")
-        self._process_block(regions[0].blocks[0], bb_then)
+        # 変更: 分岐条件をcondに記録する。共有される条件の生成演算は移動しない。
+        condition = op.operands[0]
+        cond_src = self._value_to_node.get(id(condition))
+        self._graph.nodes[bb_cond]['condition'] = _ssa_name(condition)
+        self._graph.nodes[bb_cond]['condition_node'] = cond_src
+        # 同じMLIRブロック内で、このifだけが使用する比較をcondに所属させる。
+        # 外側で計算した条件をループ内部へ移し、反復ごとに再計算することは避ける。
+        if (cond_src is not None
+                and self._graph.nodes[cond_src].get('op_name') in ('arith.cmpi', 'arith.cmpf')
+                and isinstance(condition.owner, Operation)
+                and condition.owner.parent_block() is op.parent_block()
+                and all(use.operation is op for use in condition.uses)):
+            owners = [src for src, _, edge in self._graph.in_edges(cond_src, data=True)
+                      if edge.get('label') == 'contains']
+            for owner in owners:
+                self._graph.remove_edge(owner, cond_src)
+            self._graph.add_edge(bb_cond, cond_src, type="ctrl", label="contains")
 
-        # BB_else（region[1]があれば）
-        if len(regions) >= 2:
-            bb_else = self._new_bb("else")
-            self._graph.add_edge(if_id, bb_else, type="ctrl", label="else")
-            self._process_block(regions[1].blocks[0], bb_else)
-            self._graph.nodes[if_id]['bb_else'] = bb_else
+        bb_then = self._new_bb("body")
+        self._graph.nodes[bb_then]['branch'] = 'then'
+        self._graph.add_edge(bb_cond, bb_then, type="ctrl", label="then")
+        _, then_end = self._process_block(regions[0].blocks[0], bb_then)
+        self._graph.add_edge(then_end, bb_exit, type="ctrl", label="next")
 
-        self._graph.nodes[if_id]['bb_then'] = bb_then
+        # 変更: elseなしの場合も、偽側から共通出口へ進む経路を明示する。
+        bb_else = None
+        if len(regions) >= 2 and regions[1].blocks:
+            bb_else = self._new_bb("body")
+            self._graph.nodes[bb_else]['branch'] = 'else'
+            self._graph.add_edge(bb_cond, bb_else, type="ctrl", label="else")
+            _, else_end = self._process_block(regions[1].blocks[0], bb_else)
+            self._graph.add_edge(else_end, bb_exit, type="ctrl", label="next")
+        else:
+            self._graph.add_edge(bb_cond, bb_exit, type="ctrl", label="else")
+
+        self._graph.nodes[if_id].update(
+            bb_init=bb_init, bb_cond=bb_cond, bb_body=bb_then,
+            bb_then=bb_then, bb_else=bb_else, bb_exit=bb_exit,
+        )
+        self._graph.nodes[bb_init].update(
+            unit_kind="if", bb_init=bb_init, bb_cond=bb_cond,
+            bb_body=bb_then, bb_then=bb_then, bb_else=bb_else, bb_exit=bb_exit,
+        )
 
     # ----------------------------------------------------------------
     # ブロック引数を登録
