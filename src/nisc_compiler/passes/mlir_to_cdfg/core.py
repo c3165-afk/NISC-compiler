@@ -15,6 +15,10 @@ lowering.py: MLIRテキスト → networkx CDFG（Control Data Flow Graph）変�
 
 変更: 各処理単位の入口にunit_kindとbb_init/bb_body/bb_exit等を記録する。
       空の入口・出口もCDFGに残す。ステート割り当てやFSM生成は後段で扱う。
+      関数直下の入口にはdispatch_candidate、dispatch_scope、dispatch_index、
+      required_completedを記録する。required_completedは完了を待つ入口IDのリスト。
+      関数先頭の入口のdispatch_entriesに、同じ探索範囲の入口を元の順序で保存する。
+      これらはコンパイル時の情報であり、実行時のフラグやステートは生成しない。
 """
 from __future__ import annotations
 import networkx as nx
@@ -104,6 +108,41 @@ class MLIRToCDFG:
                 for arg in block.args:
                     arg_id = self._value_to_node[id(arg)]
                     self._graph.add_edge(bb_init, arg_id, type="ctrl", label="contains")
+                # 変更: 全処理の出口が確定してから、関数直下の入口の準備条件を記録する。
+                self._record_entry_conditions(bb_init, bb_exit)
+
+    def _record_entry_conditions(self, first_bb: int, last_bb: int):
+        # 変更: 最初は元の順序を維持し、直前の処理単位の完了を開始条件とする。
+        # 各単位のbb_exitから次へ進むため、ループや分岐の内部の入口は探索対象にしない。
+        # 入力値だけでなく、メモリ操作などもこの完了順序によって追い越しを防ぐ。
+        entries = []
+        current = first_bb
+        while True:
+            if current in entries:
+                raise ValueError("関数直下の処理単位の接続が循環しています。")
+            entry = self._graph.nodes[current]
+            if entry.get('bb_init') != current or 'unit_kind' not in entry:
+                raise ValueError("処理単位の入口情報がありません。")
+            entry.update(
+                dispatch_candidate=True,
+                dispatch_scope=first_bb,
+                dispatch_index=len(entries),
+                required_completed=[entries[-1]] if entries else [],
+            )
+            entries.append(current)
+            bb_exit = entry['bb_exit']
+            if bb_exit == last_bb:
+                break
+            successors = [dst for _, dst, edge in self._graph.out_edges(bb_exit, data=True)
+                          if edge.get('type') == 'ctrl' and edge.get('label') == 'next'
+                          and self._graph.nodes[dst].get('type') == 'bb']
+            if len(successors) != 1:
+                raise ValueError("処理単位の出口には次の入口への接続が一つ必要です。")
+            current = successors[0]
+
+        # 先頭の空条件は「関数開始後、先行単位の待機なし」を意味する。
+        # 後段では未完了の確認も行い、開始済みではなく完了情報を使って判定する。
+        self._graph.nodes[first_bb]['dispatch_entries'] = entries
 
     # ----------------------------------------------------------------
     # ブロック処理
@@ -707,6 +746,9 @@ class MLIRToCDFG:
             results=[],
             mlir_typ="",
         )
+        # 変更: initという名前だけでは探索対象にしない。関数直下の入口だけ後から有効化する。
+        if label == "init":
+            self._graph.nodes[nid]['dispatch_candidate'] = False
         return nid
 
 
