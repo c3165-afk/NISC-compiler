@@ -237,98 +237,85 @@ def _assign_entry_states(cdfg: nx.DiGraph) -> int:
     return len(entries)
 
 
+def _order_bbs_by_resources(cdfg: nx.DiGraph, bb_ids: list[int]) -> list[int]:
+    # 変更: 同じ資源集合のBBをまとめ、共通資源の割合が大きい集合を隣へ置く。
+    # 同率の場合は入力順（CDFGのBB生成順）を維持し、配置を再現可能にする。
+    groups = {}
+    empty_bbs = []
+    for bb_id in bb_ids:
+        resources = frozenset(cdfg.nodes[bb_id]['resources'])
+        if not resources:
+            empty_bbs.append(bb_id)
+        else:
+            groups.setdefault(resources, []).append(bb_id)
+    ordered = []
+    remaining = list(groups)
+    if remaining:
+        current = remaining.pop(0)
+        while True:
+            ordered.extend(groups[current])
+            if not remaining:
+                break
+            # Jaccard類似度。maxは同率なら先に現れた候補を選ぶ。
+            current = max(remaining, key=lambda candidate:
+                          len(current & candidate) / len(current | candidate))
+            remaining.remove(current)
+    # 演算器を使わない出口・return等は、演算BBの後ろにまとめる。
+    return ordered + empty_bbs
+
+
 def schedule(
     cdfg: nx.DiGraph,
     operators: list[Operator] = None,
 ) -> nx.DiGraph:
     """
-    CDFGの全BBをASAPスケジューリングする。
+    BB内を相対スケジュールし、入口・初期化・資源が似たBBの順に区間を配置する。
 
-    CFGのlabelを見てthen/elseブロックには同じstate_offsetを与える。
-    ループのbodyブロックはcondブロックの後から始まる。
-
-    Args:
-        cdfg:      対象のCDFG
-        operators: DP演算器リスト（Noneでデフォルト）
-
-    Returns:
-        state属性が追加されたCDFG
+    変更: 配置番号の順序と実行順序を分離する。実行順序を表すCFGは変更しない。
+    各BBのstart_state/end_stateは実行区間の両端（終端を含む）。
+    探索対象のbb_init自身のstateは、これとは別の入口判定用ステートである。
+    FSMの遷移と、配置番号の大小に依存しない生存区間への対応は後段で必要。
     """
     if operators is None:
         operators = load_dp()
-
-    # 変更: 入口判定用の区間を先に確保し、全演算をその区間より後ろへ配置する。
-    # まだ探索の遷移やフラグ回路は生成しない。入口メタデータがなければ従来どおり0始まり。
     entry_state_count = _assign_entry_states(cdfg)
-
-    # BBをトポロジカル順序で処理
-    # ただしthen/elseは同じoffsetから始める
-    bb_offset: dict[int, int] = {}  # bb_id → state_offset
-    bb_last: dict[int, int] = {}    # bb_id → last_state
-
-    # エントリBBを探す（入力エッジがないBB）
     all_bbs = _get_all_bbs(cdfg)
-    bb_set = set(all_bbs)
+    op_map = {op.name: op for op in operators}
 
-    # BBのトポロジカルソート
-    bb_subgraph = cdfg.subgraph(all_bbs)
-    try:
-        topo_bbs = [n for n in nx.topological_sort(bb_subgraph) if n in bb_set]
-    except nx.NetworkXUnfeasible:
-        topo_bbs = all_bbs
+    # 変更: 既存のschedule_bbの演算選択・占有期間の計算をそのまま使い、
+    # まず全BBについて0始まりの相対位置と、演算が完了するまでの長さを求める。
+    for bb_id in all_bbs:
+        local_end = schedule_bb(cdfg, bb_id, operators, state_offset=0)
+        resources = set()
+        for nid in _get_bb_subgraph(cdfg, bb_id):
+            operator = op_map[cdfg.nodes[nid]['assigned_op']]
+            resources.add(operator.resource or operator.name)
+        cdfg.nodes[bb_id]['resources'] = sorted(resources)
+        # 空BBにも制御遷移先として1ステートを確保する。演算を追加するわけではない。
+        cdfg.nodes[bb_id]['state_count'] = max(1, local_end + 1)
 
+    # 入口判定は先頭に置き、その後に探索対象initの初期化区間をプログラム順で置く。
+    entry_bbs = sorted(
+        (bb for bb in all_bbs if cdfg.nodes[bb].get('dispatch_candidate')),
+        key=lambda bb: cdfg.nodes[bb]['state'],
+    )
+    remaining = [bb for bb in all_bbs if not cdfg.nodes[bb].get('dispatch_candidate')]
+    layout = entry_bbs + _order_bbs_by_resources(cdfg, remaining)
     current_offset = entry_state_count
+    for bb_id in layout:
+        data = cdfg.nodes[bb_id]
+        data['start_state'] = current_offset
+        data['end_state'] = current_offset + data['state_count'] - 1
+        for nid in _get_bb_subgraph(cdfg, bb_id):
+            cdfg.nodes[nid]['state'] = current_offset + cdfg.nodes[nid]['local_state']
+        current_offset = data['end_state'] + 1
 
-    for bb_id in topo_bbs:
-        # このBBのoffsetを決定
-        # 既に設定済み（then/elseで同じoffsetを使う）なら使う
-        if bb_id not in bb_offset:
-            bb_offset[bb_id] = current_offset
-
-        offset = bb_offset[bb_id]
-        last_state = schedule_bb(cdfg, bb_id, operators, state_offset=offset)
-        bb_last[bb_id] = last_state
-
-        # 子BBのoffsetを設定
-        children = _get_ctrl_children(cdfg, bb_id)
-
-        # scf.ifのthen/else → 同じoffsetから始まる
-        then_bbs = children.get('then', [])
-        else_bbs = children.get('else', [])
-        if then_bbs or else_bbs:
-            branch_offset = last_state + 1
-            for child in then_bbs + else_bbs:
-                if child not in bb_offset:
-                    bb_offset[child] = branch_offset
-            # 合流後のoffsetは後でmax計算
-            continue
-
-        # scf.forのbody → forの後から始まる
-        body_bbs = children.get('body', [])
-        cond_bbs = children.get('cond', [])
-        for child in body_bbs + cond_bbs:
-            if child not in bb_offset:
-                bb_offset[child] = last_state + 1
-
-        # contains → 通常の連番
-        contains_bbs = children.get('contains', [])
-        for child in contains_bbs:
-            if child not in bb_offset:
-                bb_offset[child] = last_state + 1
-
-        # offsetを更新
-        if not (then_bbs or else_bbs or body_bbs or cond_bbs or contains_bbs):
-            current_offset = last_state + 1
-
-    # then/else合流後のoffsetを計算
-    # （簡易的にbb_lastの最大値+1を使う）
-    if bb_last:
-        current_offset = max(bb_last.values()) + 1
-
-    # doneステートを追加
-    cdfg = _add_done_state(cdfg)
-
-    return cdfg
+    # 変更: 後段が空BBも含めて配置を参照できるよう、区間順と終了位置を記録する。
+    cdfg.graph['bb_layout'] = layout
+    cdfg.graph['entry_state_count'] = entry_state_count
+    cdfg.graph['done_state'] = current_offset
+    cdfg.graph['state_count'] = current_offset + 1
+    return _add_done_state(cdfg, done_state=current_offset)
 
 
 def print_schedule(cdfg: nx.DiGraph):
@@ -341,6 +328,11 @@ def print_schedule(cdfg: nx.DiGraph):
         if cdfg.nodes[bb_id].get('dispatch_candidate'):
             entry_state = cdfg.nodes[bb_id].get('state')
             print(f"[{bb_id}] {bb_name}: entry-check state {entry_state}")
+        # 変更: 空BBの制御区間も含め、配置先と使用資源を表示する。
+        bb_data = cdfg.nodes[bb_id]
+        if 'start_state' in bb_data:
+            print(f"[{bb_id}] {bb_name}: states {bb_data['start_state']}..{bb_data['end_state']}"
+                  f" resources={bb_data['resources']}")
         op_nodes = _get_bb_subgraph(cdfg, bb_id)
         if not op_nodes:
             continue
@@ -367,25 +359,29 @@ def print_schedule(cdfg: nx.DiGraph):
 
 
 
-def _add_done_state(cdfg: nx.DiGraph) -> nx.DiGraph:
-    """
-    bb_exitが空の場合にdoneノードを追加してstateを割り当てる。
-    emitter.pyがそのstateでio.done := true.Bを生成する。
-    """
-    # 全opノードの最大stateを取得
-    all_states = [
-        d.get('state') for _, d in cdfg.nodes(data=True)
-        if d.get('state') is not None
-    ]
-    if not all_states:
-        return cdfg
+def _add_done_state(cdfg: nx.DiGraph, done_state: int | None = None) -> nx.DiGraph:
+    """関数の終了ノードへ、全区間の後ろのdoneステートを設定する。"""
+    if done_state is None:
+        # 変更: 再配置前のdoneを数えず、演算の完了と空BBの区間末尾も考慮する。
+        last_states = []
+        for _, data in cdfg.nodes(data=True):
+            if data.get('op_name') == 'done':
+                continue
+            if data.get('end_state') is not None:
+                last_states.append(data['end_state'])
+            if data.get('state') is not None:
+                latency = data.get('latency', 1) if data.get('type') == 'op' else 1
+                last_states.append(data['state'] + latency - 1)
+        if not last_states:
+            return cdfg
+        done_state = max(last_states) + 1
 
-    done_state = max(all_states) + 1
-
-    # bb_exitを探す
-    exit_bbs = [
+    # 変更: 通常演算やループのexitは関数終了ではないため、doneを追加しない。
+    # 新形式はfunction_exitを使い、旧形式でも次のBBがない出口だけを対象にする。
+    function_exits = [n for n, d in cdfg.nodes(data=True) if d.get('function_exit')]
+    exit_bbs = function_exits or [
         n for n, d in cdfg.nodes(data=True)
-        if d.get('op_name') == 'bb_exit'
+        if d.get('op_name') == 'bb_exit' and not _get_ctrl_children(cdfg, n)
     ]
 
     for bb_id in exit_bbs:
@@ -412,7 +408,7 @@ def _add_done_state(cdfg: nx.DiGraph) -> nx.DiGraph:
 
     # lowering.pyで追加済みのdoneノードにstateを割り当てる
     for nid, data in cdfg.nodes(data=True):
-        if data.get('op_name') == 'done' and data.get('state') is None:
+        if data.get('op_name') == 'done':
             cdfg.nodes[nid]['state'] = done_state
 
     return cdfg
@@ -420,9 +416,12 @@ def _add_done_state(cdfg: nx.DiGraph) -> nx.DiGraph:
 
 def reset_states(cdfg: nx.DiGraph) -> nx.DiGraph:
     """全ノードのstate属性をリセットする。スピルノード挿入後の再スケジューリング用。"""
+    # 変更: 区間と相対位置も破棄し、スピル挿入後に古い配置情報を参照させない。
     for nid in cdfg.nodes():
-        if 'state' in cdfg.nodes[nid]:
-            del cdfg.nodes[nid]['state']
+        for attr in ('state', 'local_state', 'start_state', 'end_state', 'state_count', 'resources'):
+            cdfg.nodes[nid].pop(attr, None)
+    for attr in ('bb_layout', 'entry_state_count', 'done_state', 'state_count'):
+        cdfg.graph.pop(attr, None)
     return cdfg
 
 
