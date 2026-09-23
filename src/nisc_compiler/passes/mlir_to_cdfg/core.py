@@ -463,6 +463,27 @@ class MLIRToCDFG:
             return _ssa_name(inner)
         return _ssa_name(val)
 
+    def _record_value_transfers(self, src_bb, dst_bb, sources, destinations, region_id):
+        # 変更: 経路ごとの値の受け渡しを記録する。同じ辺の代入は並列代入であり、
+        # レジスタの共有や実際のコピー命令の生成は後段で判断する。
+        sources = [self._alias_map.get(v, v) for v in sources]
+        destinations = list(destinations)
+        if len(sources) != len(destinations):
+            raise ValueError("制御経路の受け渡し元と受け渡し先の数が一致しません。")
+        edge = self._graph.edges[src_bb, dst_bb]
+        self._graph.nodes[region_id]['value_transfer_version'] = 1
+        edge.setdefault('value_transfers', []).extend(
+            dict(source=src, destination=dst, region=region_id)
+            for src, dst in zip(sources, destinations)
+        )
+
+    def _yield_values(self, block):
+        # 変更: 入れ子のyieldと取り違えないよう、元のMLIR領域の終端を参照する。
+        terminator = list(block.ops)[-1]
+        if terminator.name != 'scf.yield':
+            raise ValueError("領域の終端にscf.yieldが必要です。")
+        return [_ssa_name(v) for v in terminator.operands]
+
     # ----------------------------------------------------------------
     # scf.while の CFG構造
     #
@@ -504,6 +525,17 @@ class MLIRToCDFG:
             unit_kind="while", bb_init=bb_init, bb_cond=bb_cond,
             bb_body=bb_body, bb_exit=bb_exit,
         )
+        # 変更: conditionが渡す値は、真なら本体引数、偽ならwhileの結果になる。
+        before_args = [_ssa_name(v) for v in regions[0].blocks[0].args]
+        after_args = [_ssa_name(v) for v in regions[1].blocks[0].args]
+        forwarded = [_ssa_name(v) for v in condition.operands[1:]]
+        self._record_value_transfers(bb_init, bb_cond,
+            self._graph.nodes[while_id]['operands'], before_args, while_id)
+        self._record_value_transfers(cond_end, bb_body, forwarded, after_args, while_id)
+        self._record_value_transfers(cond_end, bb_exit, forwarded,
+            self._graph.nodes[while_id]['results'], while_id)
+        self._record_value_transfers(body_end, bb_cond,
+            self._yield_values(regions[1].blocks[0]), before_args, while_id)
 
     # ----------------------------------------------------------------
     # scf.for の CFG構造
@@ -587,6 +619,8 @@ class MLIRToCDFG:
             )
             self._value_to_node[cmp_result] = cmp_id
             self._graph.add_edge(bb_cond, cmp_id, type="ctrl", label="contains")
+            # 変更: forもif/whileと同じ形式で、実際の分岐位置の条件使用を記録する。
+            self._graph.nodes[bb_cond].update(condition=cmp_result, condition_node=cmp_id)
 
             # iv_argのノードがあればデータエッジを追加
             iv_src = self._value_to_node.get(id(iv_arg))
@@ -653,6 +687,16 @@ class MLIRToCDFG:
             unit_kind="for", bb_init=bb_init, bb_cond=bb_cond,
             bb_body=bb_body, bb_incr=bb_incr, bb_exit=bb_exit,
         )
+        # 変更: 反復引数はcondへの入口で更新する。偽の出口は現在値を返すため、
+        # 反復回数が0でも初期値が結果へ渡る。ivの初期書き込みは既存iv_initが担う。
+        carried = [_ssa_name(v) for v in block_args_list[1:]]
+        self._record_value_transfers(bb_init, bb_cond,
+            self._graph.nodes[for_id]['operands'][3:], carried, for_id)
+        self._record_value_transfers(bb_incr, bb_cond,
+            [incr_result] + self._yield_values(regions[0].blocks[0]),
+            [_ssa_name(iv_arg)] + carried, for_id)
+        self._record_value_transfers(bb_cond, bb_exit, carried,
+            self._graph.nodes[for_id]['results'], for_id)
         # 変更: 次の処理への接続は_process_blockが担当する。
         # 内側forの直後にある通常演算を飛ばして外側incrへ接続しない。
 
@@ -691,6 +735,8 @@ class MLIRToCDFG:
         self._graph.add_edge(bb_cond, bb_then, type="ctrl", label="then")
         _, then_end = self._process_block(regions[0].blocks[0], bb_then)
         self._graph.add_edge(then_end, bb_exit, type="ctrl", label="next")
+        self._record_value_transfers(then_end, bb_exit,
+            self._yield_values(regions[0].blocks[0]), self._graph.nodes[if_id]['results'], if_id)
 
         # 変更: elseなしの場合も、偽側から共通出口へ進む経路を明示する。
         bb_else = None
@@ -700,6 +746,8 @@ class MLIRToCDFG:
             self._graph.add_edge(bb_cond, bb_else, type="ctrl", label="else")
             _, else_end = self._process_block(regions[1].blocks[0], bb_else)
             self._graph.add_edge(else_end, bb_exit, type="ctrl", label="next")
+            self._record_value_transfers(else_end, bb_exit,
+                self._yield_values(regions[1].blocks[0]), self._graph.nodes[if_id]['results'], if_id)
         else:
             self._graph.add_edge(bb_cond, bb_exit, type="ctrl", label="else")
 

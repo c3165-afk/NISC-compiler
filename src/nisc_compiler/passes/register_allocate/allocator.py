@@ -21,6 +21,74 @@ class AllocationError(Exception):
     pass
 
 
+def _collect_bb_flow(cdfg: nx.DiGraph) -> dict:
+    """配置番号を使わず、所属・論理CFG・経路上の並列代入を整理する。"""
+    # 変更: 第1段階では解析用情報だけを作る。既存の彩色や生存区間は変更しない。
+    # SSA名は関数間で重複し得るため、後段はfunction_of_bbで関数を区別する。
+    bbs = {n: [] for n, d in cdfg.nodes(data=True) if d.get('type') == 'bb'}
+    owners = {}
+    successors = {bb: [] for bb in bbs}
+    predecessors = {bb: [] for bb in bbs}
+    transfers = {}
+    for src, dst, edge in cdfg.edges(data=True):
+        if edge.get('type') != 'ctrl':
+            continue
+        if edge.get('label') == 'contains':
+            if src not in bbs or dst in bbs or dst in owners:
+                raise AllocationError(f"BBへの所属が不正または重複しています: {src} -> {dst}")
+            owners[dst] = src
+            bbs[src].append(dst)
+        elif src in bbs and dst in bbs:
+            successors[src].append(dst)
+            predecessors[dst].append(src)
+            # コピーして保持し、解析によって元のCDFGの辺を書き換えない。
+            copies = [dict(item) for item in edge.get('value_transfers', [])]
+            destinations = [item['destination'] for item in copies]
+            if len(destinations) != len(set(destinations)):
+                raise AllocationError(f"同じ経路で受け渡し先が重複しています: {src} -> {dst}")
+            transfers[src, dst] = copies
+
+    node_uses, node_defs = {}, {}
+    region_ops = {'scf.for', 'scf.while', 'scf.if'}
+    for nid, data in cdfg.nodes(data=True):
+        if data.get('type') == 'bb':
+            continue
+        if nid not in owners:
+            raise AllocationError(f"所属BBがありません: node {nid}")
+        name = data.get('op_name')
+        if name in region_ops and data.get('value_transfer_version') != 1:
+            raise AllocationError(f"領域の値の受け渡し情報がありません。CDFGを再生成してください: {nid}")
+        # 変更: 領域の結果はinitで定義されない。yield/conditionの転送値も
+        # 通常の演算入力ではなく、実際の遷移辺で使用されるものとして分離する。
+        # block_argは所属BBで毎回定義せず、流入辺の受け渡しで定義する。
+        pseudo = name in region_ops or name in {'scf.yield', 'scf.condition', 'block_arg'}
+        node_uses[nid] = [] if pseudo else list(data.get('operands', []))
+        node_defs[nid] = [] if pseudo else list(data.get('results', []))
+
+    # 変更: 比較結果は比較命令の実行時ではなく、BB末尾の分岐でも使用する。
+    branch_uses = {bb: [cdfg.nodes[bb]['condition']]
+                   if cdfg.nodes[bb].get('condition') is not None else [] for bb in bbs}
+    function_of_bb = {}
+    for entry in bbs:
+        if not cdfg.nodes[entry].get('function_entry'):
+            continue
+        pending = [entry]
+        while pending:
+            bb = pending.pop()
+            if bb in function_of_bb:
+                if function_of_bb[bb] != entry:
+                    raise AllocationError(f"異なる関数の制御経路が接続しています: BB {bb}")
+                continue
+            function_of_bb[bb] = entry
+            pending.extend(successors[bb])
+    if set(function_of_bb) != set(bbs):
+        raise AllocationError("関数入口から到達できないBBがあります。")
+    return dict(bb_nodes=bbs, node_to_bb=owners, successors=successors,
+                predecessors=predecessors, edge_transfers=transfers,
+                node_uses=node_uses, node_defs=node_defs, branch_uses=branch_uses,
+                function_of_bb=function_of_bb)
+
+
 @dataclass
 class LiveRange:
     """SSA変数の生存区間。"""
@@ -449,7 +517,11 @@ def allocate(
     Returns:
         (更新されたCDFG, SSA→汎用レジスタマッピング, SSA→即値レジスタマッピング)
     """
-# 1. 即値レジスタの割り当て（arith.constant）
+    # 変更: スピル挿入などでCDFGが変わるため、割り当ての呼び出しごとに再収集する。
+    # 次段階のLIVE_IN/LIVE_OUT解析で使う。現段階では割り当ての判断には使わない。
+    cdfg.graph['register_flow'] = _collect_bb_flow(cdfg)
+
+    # 1. 即値レジスタの割り当て（arith.constant）
     # 同じ値のarith.constantは同じIMMレジスタを使い回す
     imm_map: dict[str, int] = {}
     imm_counter = 0
