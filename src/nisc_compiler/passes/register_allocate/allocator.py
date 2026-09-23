@@ -89,6 +89,52 @@ def _collect_bb_flow(cdfg: nx.DiGraph) -> dict:
                 function_of_bb=function_of_bb)
 
 
+def _compute_bb_liveness(flow: dict) -> dict:
+    """BB入口・出口の生存値を、論理CFG上で変化がなくなるまで計算する。"""
+    # 変更: 第2段階。値名は各関数のCFG内でのみ伝播させ、stateの大小は使わない。
+    # BB内部はSSAの定義・使用を扱う。同じBBで作る値は入口から持ち込まない。
+    # 読み書きのサイクルや演算の完了時刻による干渉判定は、次段階で扱う。
+    bb_defs, bb_uses = {}, {}
+    for bb, nodes in flow['bb_nodes'].items():
+        definitions = {value for nid in nodes for value in flow['node_defs'][nid]}
+        uses = {value for nid in nodes for value in flow['node_uses'][nid]}
+        uses.update(flow['branch_uses'][bb])
+        bb_defs[bb] = definitions
+        bb_uses[bb] = uses - definitions
+
+    # 変更: LIVE_INは流入辺の並列代入「後」、LIVE_OUTは流出辺の並列代入「前」。
+    # dst <- srcを逆向きにたどると、dstの旧値は不要になり、srcの値が必要になる。
+    # 代入を順番に適用せず、一括で宛先を除いてから全入力を加える（交換にも対応）。
+    edge_defs, edge_uses = {}, {}
+    for edge, copies in flow['edge_transfers'].items():
+        edge_defs[edge] = {item['destination'] for item in copies}
+        edge_uses[edge] = {item['source'] for item in copies}
+    live_in = {bb: set() for bb in flow['bb_nodes']}
+    live_out = {bb: set() for bb in flow['bb_nodes']}
+    edge_live = {edge: set() for edge in flow['edge_transfers']}
+    changed = True
+    while changed:
+        changed = False
+        for bb in reversed(list(flow['bb_nodes'])):
+            outgoing = set()
+            for successor in flow['successors'][bb]:
+                edge = (bb, successor)
+                # 未使用コピーの削除はまだ行わないため、全コピー元を使用として残す。
+                # 分岐ごとのコピー元はその辺だけで加え、別の分岐へ混入させない。
+                required = (live_in[successor] - edge_defs[edge]) | edge_uses[edge]
+                edge_live[edge] = required
+                outgoing.update(required)
+            incoming = bb_uses[bb] | (outgoing - bb_defs[bb])
+            if outgoing != live_out[bb] or incoming != live_in[bb]:
+                live_out[bb] = outgoing
+                live_in[bb] = incoming
+                changed = True
+
+    # 定数も含む意味上の生存情報。IMM/GPRの選別はレジスタ干渉の構築時に行う。
+    return dict(bb_uses=bb_uses, bb_defs=bb_defs, live_in=live_in,
+                live_out=live_out, edge_live=edge_live)
+
+
 @dataclass
 class LiveRange:
     """SSA変数の生存区間。"""
@@ -518,8 +564,11 @@ def allocate(
         (更新されたCDFG, SSA→汎用レジスタマッピング, SSA→即値レジスタマッピング)
     """
     # 変更: スピル挿入などでCDFGが変わるため、割り当ての呼び出しごとに再収集する。
-    # 次段階のLIVE_IN/LIVE_OUT解析で使う。現段階では割り当ての判断には使わない。
-    cdfg.graph['register_flow'] = _collect_bb_flow(cdfg)
+    # 変更: 第2段階のBB生存解析まで行い、再実行時は古い解析結果を置き換える。
+    # 現段階では既存の干渉グラフ・彩色の判断にはまだ使わない。
+    flow = _collect_bb_flow(cdfg)
+    flow.update(_compute_bb_liveness(flow))
+    cdfg.graph['register_flow'] = flow
 
     # 1. 即値レジスタの割り当て（arith.constant）
     # 同じ値のarith.constantは同じIMMレジスタを使い回す
