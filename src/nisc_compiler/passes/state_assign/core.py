@@ -9,7 +9,8 @@ scheduler.py: CDFGへのASAPスケジューリング
   3. BBの境界:   BBが違えば必ず別のステートグループ
 
 ノードに追加される属性:
-  state: ステート番号（0始まり）
+  local_state: BBの先頭を0とした演算の開始位置
+  state: state_offset + local_stateで求める配置先のステート番号
 """
 from __future__ import annotations
 from collections import defaultdict
@@ -52,13 +53,17 @@ def schedule_bb(
     state_offset: int = 0,
 ) -> int:
     """
-    1つのBBを、占有期間と最長依存鎖を考慮してASAP配置する。
+    1つのBB内の相対スケジュールを求め、指定オフセットにASAP配置する。
+
+    変更: BB内の依存関係・占有期間・優先順位の計算は維持し、
+    BB外のstateを時刻として参照しない。外部入力はBB開始時に利用可能とする。
+    この前提は、後段のBB間の制御遷移・完了待ち・値の保持によって保証する。
 
     Args:
         cdfg:         対象のCDFG
         bb_id:        スケジューリング対象のBBノードID
         operators:    DP演算器リスト
-        state_offset: このBBのステート番号の開始オフセット
+        state_offset: 相対スケジュールを配置する開始オフセット（BB内の配置には影響しない）
 
     Returns:
         このBBの演算が完了する最後のステート番号（開始 + latency - 1）
@@ -93,7 +98,6 @@ def schedule_bb(
     dependencies.add_nodes_from(groups)
     group_ops = {}
     capacity = {}
-    release = dict.fromkeys(groups, state_offset)
     rank = {key: i for i, key in enumerate(groups)}
     for key, members in groups.items():
         names = {cdfg.nodes[n].get('assigned_op') for n in members}
@@ -122,12 +126,8 @@ def schedule_bb(
                 if pred in owner:
                     if owner[pred] != key:
                         dependencies.add_edge(owner[pred], key)
-                else:
-                    # BB外の既存の依存時刻を保持する。BBをまたぐ移動は行わない。
-                    previous = cdfg.nodes[pred]
-                    if previous.get('state') is not None:
-                        release[key] = max(release[key], previous['state']
-                                           + previous.get('latency', 1))
+                # 変更: BB外のstateは配置番号であり、このBBの相対時刻ではない。
+                # 外部への依存エッジ自体は残し、BB開始前の完了確認を後段に任せる。
     try:
         topology = list(nx.topological_sort(dependencies))
     except nx.NetworkXUnfeasible:
@@ -152,9 +152,10 @@ def schedule_bb(
             # 既存のpipelined=Trueは開始間隔1という契約を維持する。
             # 結果の利用可能時刻は、パイプラインでもlatency後とする。
             duration = 1 if operator.pipelined else operator.latency
-            state = max(release[key], max(
+            # 変更: 開始位置はBB内の相対時刻で計算し、外部の配置番号を混ぜない。
+            state = max(
                 (finish[pred] for pred in dependencies.predecessors(key)),
-                default=state_offset))
+                default=0)
             # 変更: 開始時点だけでなく占有期間の全サイクルで空きを確認する。
             # 将来の予約と重なる場合は、期間全体が入る位置まで進める。
             while any(state_usage[t][resource] >= capacity[resource]
@@ -169,7 +170,9 @@ def schedule_bb(
         resource = operator.resource or operator.name
         duration = 1 if operator.pipelined else operator.latency
         for nid in groups[key]:
-            cdfg.nodes[nid]['state'] = state
+            # 変更: 相対位置を保存し、既存の呼び出し側にはオフセット付きstateを渡す。
+            cdfg.nodes[nid]['local_state'] = state
+            cdfg.nodes[nid]['state'] = state_offset + state
         for t in range(state, state + duration):
             state_usage[t][resource] += 1
         finish[key] = state + operator.latency
@@ -180,7 +183,8 @@ def schedule_bb(
                 ready.add(child)
 
     # 変更: BBの使用期間には、最後の演算の開始だけでなく完了までを含める。
-    return max(finish.values()) - 1
+    # 変更: 戻り値は従来どおり配置先の最終ステート。空BBは冒頭でoffset - 1を返す。
+    return state_offset + max(finish.values()) - 1
 
 
 def _get_ctrl_children(cdfg: nx.DiGraph, bb_id: int) -> dict[str, list[int]]:
