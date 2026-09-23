@@ -11,6 +11,7 @@ scheduler.py: CDFGへのASAPスケジューリング
 ノードに追加される属性:
   local_state: BBの先頭を0とした演算の開始位置
   state: state_offset + local_stateで求める配置先のステート番号
+         探索対象のbb_initでは、演算とは別の入口判定用ステート番号
 """
 from __future__ import annotations
 from collections import defaultdict
@@ -207,6 +208,35 @@ def _get_parent_ctrl(cdfg: nx.DiGraph, bb_id: int):
     return None
 
 
+def _assign_entry_states(cdfg: nx.DiGraph) -> int:
+    # 変更: 関数直下の入口だけを、loweringが記録したプログラム順で先頭に配置する。
+    # BBの生成順や演算の依存順では並べない。入れ子のinitは探索対象に含めない。
+    entries = []
+    for scope, data in cdfg.nodes(data=True):
+        if not data.get('function_entry'):
+            continue
+        for index, bb_id in enumerate(data.get('dispatch_entries', [])):
+            if bb_id not in cdfg:
+                raise ScheduleError(f"Unknown dispatch entry: {bb_id}")
+            entry = cdfg.nodes[bb_id]
+            if (entry.get('type') != 'bb' or entry.get('op_name') != 'bb_init'
+                    or not entry.get('dispatch_candidate')
+                    or entry.get('dispatch_scope') != scope
+                    or entry.get('dispatch_index') != index
+                    or bb_id in entries):
+                raise ScheduleError(f"Invalid dispatch entry metadata: {bb_id}")
+            entries.append(bb_id)
+
+    candidates = {n for n, d in cdfg.nodes(data=True) if d.get('dispatch_candidate')}
+    if set(entries) != candidates:
+        raise ScheduleError("Dispatch entries do not cover the dispatch candidates")
+    for state, bb_id in enumerate(entries):
+        # forのiv初期化など、init内の演算のstateとは区別してBB自身に記録する。
+        # このstateでは準備判定を行い、準備済みの場合だけ初期化演算へ進む想定。
+        cdfg.nodes[bb_id]['state'] = state
+    return len(entries)
+
+
 def schedule(
     cdfg: nx.DiGraph,
     operators: list[Operator] = None,
@@ -227,6 +257,10 @@ def schedule(
     if operators is None:
         operators = load_dp()
 
+    # 変更: 入口判定用の区間を先に確保し、全演算をその区間より後ろへ配置する。
+    # まだ探索の遷移やフラグ回路は生成しない。入口メタデータがなければ従来どおり0始まり。
+    entry_state_count = _assign_entry_states(cdfg)
+
     # BBをトポロジカル順序で処理
     # ただしthen/elseは同じoffsetから始める
     bb_offset: dict[int, int] = {}  # bb_id → state_offset
@@ -243,7 +277,7 @@ def schedule(
     except nx.NetworkXUnfeasible:
         topo_bbs = all_bbs
 
-    current_offset = 0
+    current_offset = entry_state_count
 
     for bb_id in topo_bbs:
         # このBBのoffsetを決定
@@ -303,6 +337,10 @@ def print_schedule(cdfg: nx.DiGraph):
 
     for bb_id in bbs:
         bb_name = cdfg.nodes[bb_id].get('op_name', 'bb')
+        # 変更: 演算を持たない入口でも、判定用ステートの配置を確認できるよう表示する。
+        if cdfg.nodes[bb_id].get('dispatch_candidate'):
+            entry_state = cdfg.nodes[bb_id].get('state')
+            print(f"[{bb_id}] {bb_name}: entry-check state {entry_state}")
         op_nodes = _get_bb_subgraph(cdfg, bb_id)
         if not op_nodes:
             continue
